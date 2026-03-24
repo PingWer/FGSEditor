@@ -5,8 +5,12 @@
 The editor supports both **static FGS** (single event) and **dynamic FGS** (multiple events).
 
 ## 🚀 Features
-* **Event Modification:** Adjust the `sY`, `sCb`, and `sCr` values of any specific event.
-* **Timeline Adjustment:** Modify the start and end times of an event within a dynamic FGS.
+- Grain value-strength tuning on Luma and Chroma indipendently
+- Dynamic control of value-strength points and interpolated values visualization
+- Easy clear on sets of value in individual events
+- Edit start-end timestamp of individual events with milliseconds precision
+- Entire FGS events visualization on a average strength - seconds plot
+- Drag and drop supported
 
 ## 📥 Installation / Usage
 Since this repository does not contain the source code, you can grab the latest compiled version from the Releases page.
