@@ -1,0 +1,6 @@
+*.exe
+/build
+/dist
+/.venv
+/fgseditor_qt/__pycache__
+*.spec
