@@ -21,7 +21,7 @@ You can grab the latest compiled version directly from the Releases page:
 3. Extract the archive and run the executable.
 
 ### Build from Source
-You can build it from source using the .bat that uses pyinstaller. 
+To build the project, simply run the provided .bat file, which utilizes PyInstaller. 
 
 ## 🤝 Contributing
 Contributions are always welcome! Feel free to open an issue to report bugs or request features, or submit a Pull Request if you'd like to contribute directly to the code.
