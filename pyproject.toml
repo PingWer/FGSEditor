@@ -1,6 +1,6 @@
 [project]
 name = "FGSEditor"
-version = "1.2.0"
+version = "2.0.0"
 description = "Film Grain Strength Editor"
 requires-python = ">=3.12"
 license = "MIT"
@@ -13,3 +13,6 @@ dependencies = [
 
 [project.scripts]
 fgseditor = "fgseditor_qt.fgsview_loader:main"
+
+[tool.setuptools]
+packages = ["fgseditor_qt"]
