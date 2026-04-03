@@ -13,11 +13,14 @@ from PySide6.QtWidgets import (
     QFrame,
     QStackedWidget,
     QMenu,
+    QSplitter,
 )
 from PySide6.QtCore import Qt
 
 from . import fgs_parser
 from .plotter import InteractiveFGSPlotter
+from .grain_preview import GrainPreviewPlotter
+from .params_sidebar import ParamsSidebar
 from .shortcuts import create_standard_menu, show_credits, open_github
 
 
@@ -107,11 +110,14 @@ class MainUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FGSEditor")
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(1000, 650)
 
         self.filepath = None
         self.original_data = {}
         self.current_data = {}
+        self.original_p_params = {}
+        self.original_grain_size = 0
+        self._current_event = None
 
         self.stacked_widget = QStackedWidget()
         self.setCentralWidget(self.stacked_widget)
@@ -120,14 +126,16 @@ class MainUI(QMainWindow):
         self.stacked_widget.addWidget(self.welcome_screen)
 
         self.editor_widget = QWidget()
-        main_layout = QVBoxLayout(self.editor_widget)
-        main_layout.setContentsMargins(15, 15, 15, 15)
-        main_layout.setSpacing(15)
+        editor_outer = QVBoxLayout(self.editor_widget)
+        editor_outer.setContentsMargins(0, 0, 0, 0)
+        editor_outer.setSpacing(0)
         self.stacked_widget.addWidget(self.editor_widget)
 
+        # Top bar
         top_frame = QFrame()
         top_frame.setObjectName("toolbar")
         top_layout = QHBoxLayout(top_frame)
+        top_layout.setContentsMargins(10, 6, 10, 6)
 
         self.close_btn = QPushButton("Close FGS")
         self.close_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -138,17 +146,18 @@ class MainUI(QMainWindow):
         self.file_label.setWordWrap(True)
         top_layout.addWidget(self.file_label, stretch=1)
 
-        main_layout.addWidget(top_frame)
+        editor_outer.addWidget(top_frame)
 
         menu_bar = create_standard_menu(self)
-        main_layout.setMenuBar(menu_bar)
+        editor_outer.setMenuBar(menu_bar)
 
-        # Middle controls
+        # Middle controls bar
         mid_frame = QFrame()
         mid_frame.setObjectName("toolbar")
         mid_layout = QHBoxLayout(mid_frame)
+        mid_layout.setContentsMargins(10, 4, 10, 4)
 
-        mid_layout.addWidget(QLabel("Channel to edit:"), stretch=0)
+        mid_layout.addWidget(QLabel("Channel:"), stretch=0)
         self.channel_dropdown = QComboBox()
         self.channel_dropdown.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.channel_dropdown.addItems(["sY", "sCb", "sCr"])
@@ -156,6 +165,11 @@ class MainUI(QMainWindow):
         mid_layout.addWidget(self.channel_dropdown, stretch=0)
 
         mid_layout.addStretch(1)
+
+        self.validation_warning_label = QLabel()
+        self.validation_warning_label.setStyleSheet("color: #ff4444; font-weight: bold; background: #220000; padding: 2px 6px; border-radius: 4px;")
+        self.validation_warning_label.hide()
+        mid_layout.addWidget(self.validation_warning_label)
 
         self.save_btn = QPushButton("Save FGS")
         self.save_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -180,24 +194,148 @@ class MainUI(QMainWindow):
         self.save_plot_btn.clicked.connect(self.save_plot_as_png)
         mid_layout.addWidget(self.save_plot_btn)
 
-        main_layout.addWidget(mid_frame)
+        editor_outer.addWidget(mid_frame)
+
+        h_splitter = QSplitter(Qt.Horizontal)
+        h_splitter.setHandleWidth(4)
+        h_splitter.setStyleSheet(
+            "QSplitter::handle { background: #333355; }"
+        )
+        editor_outer.addWidget(h_splitter, stretch=1)
+
+        # Sidebar
+        self.sidebar = ParamsSidebar()
+        self.sidebar.params_changed.connect(self._on_params_changed)
+        self.sidebar.grain_size_changed.connect(self._on_grain_size_changed)
+        h_splitter.addWidget(self.sidebar)
+
+        # Right: vertical splitter (main plot on top, preview on bottom)
+        v_splitter = QSplitter(Qt.Vertical)
+        v_splitter.setHandleWidth(4)
+        v_splitter.setStyleSheet(
+            "QSplitter::handle { background: #333355; }"
+        )
+        h_splitter.addWidget(v_splitter)
 
         self.plotter = InteractiveFGSPlotter()
         self.plotter.data_changed.connect(self.on_plotter_changed)
-        main_layout.addWidget(self.plotter, stretch=1)
+        v_splitter.addWidget(self.plotter)
+
+        self.grain_preview = GrainPreviewPlotter()
+        self.grain_preview.setMinimumHeight(130)
+        v_splitter.addWidget(self.grain_preview)
+
+        # Proportion: main plot 65%, grain preview 35%
+        v_splitter.setSizes([420, 220])
+        h_splitter.setSizes([200, 800])
 
     def on_channel_change(self, text):
         self.plotter.set_active_channel(text)
 
     def on_plotter_changed(self):
         self.current_data = self.plotter.current_data
+        self._refresh_grain_preview()
+
+    def _on_params_changed(self, p_params: dict):
+        if self._current_event is not None:
+            self._current_event["p_params"] = p_params
+        self._refresh_grain_preview(p_params=p_params)
+
+    def _on_grain_size_changed(self, size: int):
+        if self._current_event is not None:
+            from .fgs_size_table import apply_size_preset_to_event
+            apply_size_preset_to_event(self._current_event, size)
+            # Sync sidebar UI with the new p_params from the preset, keeping the selected size
+            self.sidebar.load_from_event(self._current_event, size_id=size)
+        self._refresh_grain_preview(grain_size=size)
+        self._update_ui_state()
+
+    def _refresh_grain_preview(self, p_params=None, grain_size=None):
+        if p_params is None:
+            p_params = self.sidebar.get_p_params()
+        if grain_size is None:
+            grain_size = self.sidebar.get_grain_size()
+        noise_setting = self.sidebar.get_noise_setting()
+        autobalance = self.sidebar.get_autobalance()
+        # Extract all AR coefficients for luma + chroma AGC
+        cy_coeffs: list = []
+        cb_coeffs: list = []
+        cr_coeffs: list = []
+        if self._current_event:
+            from .fgs_math import extract_ar_coeffs_from_raw_lines
+            cy_coeffs, cb_coeffs, cr_coeffs = extract_ar_coeffs_from_raw_lines(
+                self._current_event.get("raw_lines", [])
+            )
+        self.grain_preview.update_preview(
+            self.current_data, p_params=p_params, grain_size=grain_size,
+            cy_coeffs=cy_coeffs, cb_coeffs=cb_coeffs, cr_coeffs=cr_coeffs,
+            noise_setting=noise_setting, autobalance=autobalance,
+        )
+        # AR stability warning on the sidebar
+        self.sidebar.set_ar_shift_warning(self.grain_preview.is_ar_unstable())
+        self._update_ui_state()
+
+    def is_dirty(self) -> bool:
+        """Check if any data or parameters have changed from the original markers."""
+        if not self.filepath:
+            return False
+            
+        if self.current_data != self.original_data:
+            return True
+        if self.sidebar.get_p_params() != self.original_p_params:
+            return True
+        if self.sidebar.get_grain_size() != self.original_grain_size:
+            return True
+        return False
+
+    def _get_validation_errors(self) -> list[str]:
+        if not self._current_event:
+            return []
+            
+        p_params = self.sidebar.get_p_params()
+        grain_size = self.sidebar.get_grain_size()
+        ar_shift = p_params.get("ar_coeff_shift", 8) if p_params else 8
+        autobalance = self.sidebar.get_autobalance()
+        
+        from .fgs_math import extract_ar_coeffs_from_raw_lines, compute_export_scale_factor, validate_fgs_pipeline
+        cy_coeffs, cb_coeffs, cr_coeffs = extract_ar_coeffs_from_raw_lines(self._current_event.get("raw_lines", []))
+        
+        all_errors = []
+        for ch, coeffs, ch_key in [("Y", cy_coeffs, "sY"), ("Cb", cb_coeffs, "sCb"), ("Cr", cr_coeffs, "sCr")]:
+            ys = self.current_data.get(ch_key, {}).get("y", [])
+            export_scale = compute_export_scale_factor(grain_size, coeffs, ar_shift) if autobalance else 1.0
+            
+            errors = validate_fgs_pipeline(coeffs, ar_shift, ys, export_scale)
+            if errors:
+                all_errors.append(f"Channel {ch}:\n" + "\n".join(" - " + e for e in errors))
+        
+        return all_errors
+
+    def _update_ui_state(self):
+        """Update window title and Save button enablement based on dirty state."""
+        dirty = self.is_dirty()
+        
+        errors = self._get_validation_errors()
+        if errors:
+            self.validation_warning_label.setText("⚠ UNSAFE PRESET")
+            self.validation_warning_label.setToolTip("\n\n".join(errors))
+            self.validation_warning_label.show()
+        else:
+            self.validation_warning_label.hide()
+            
+        self.save_btn.setEnabled(dirty)
+        
+        title = "FGSEditor"
+        if self.filepath:
+            import os
+            fname = os.path.basename(self.filepath)
+            title += f" - {fname}"
+        if dirty:
+            title += " *"
+        self.setWindowTitle(title)
 
     def closeEvent(self, event):
-        if (
-            self.current_data
-            and self.original_data
-            and self.current_data != self.original_data
-        ):
+        if self.is_dirty():
             reply = QMessageBox.question(
                 self,
                 "Unsaved Changes",
@@ -214,11 +352,7 @@ class MainUI(QMainWindow):
         event.accept()
 
     def close_fgs(self):
-        if (
-            self.current_data
-            and self.original_data
-            and self.current_data != self.original_data
-        ):
+        if self.is_dirty():
             reply = QMessageBox.question(
                 self,
                 "Unsaved Changes",
@@ -232,10 +366,15 @@ class MainUI(QMainWindow):
                 return
 
         self.filepath = None
+        self._current_event = None
         self.current_data = {}
         self.original_data = {}
+        self.original_p_params = {}
+        self.original_grain_size = 0
         self.plotter.set_data({})
+        self.grain_preview.update_preview({})
         self.stacked_widget.setCurrentIndex(0)
+        self.setWindowTitle("FGSEditor")
 
     def load_file(self):
         filename, _ = QFileDialog.getOpenFileName(
@@ -269,14 +408,27 @@ class MainUI(QMainWindow):
                 self.hide()
                 self.dynamic_ui.show()
             else:
-                parsed = events[0]["scale_data"] if events else {}
+                event = events[0] if events else {}
+                self._current_event = event
+                parsed = event.get("scale_data", {}) if event else {}
                 self.original_data = copy.deepcopy(parsed)
                 self.current_data = copy.deepcopy(parsed)
                 self.save_btn.setEnabled(True)
                 self.reset_btn.setEnabled(True)
                 self.clear_btn.setEnabled(True)
                 self.plotter.set_data(self.current_data)
+
+                # Populate sidebar from event p_params
+                if event:
+                    self.sidebar.load_from_event(event, size_id=-1)
+
+                # Capture originals for dirty check
+                self.original_p_params = self.sidebar.get_p_params()
+                self.original_grain_size = self.sidebar.get_grain_size()
+
+                self._refresh_grain_preview()
                 self.stacked_widget.setCurrentIndex(1)
+                self._update_ui_state()
         except Exception as ex:
             QMessageBox.critical(self, "Error", f"An error occurred:\n{str(ex)}")
 
@@ -293,6 +445,7 @@ class MainUI(QMainWindow):
         if reply == QMessageBox.Yes:
             self.current_data = copy.deepcopy(self.original_data)
             self.plotter.set_data(self.current_data)
+            self._refresh_grain_preview()
 
     def clear_channel(self):
         if not self.current_data:
@@ -309,40 +462,42 @@ class MainUI(QMainWindow):
             self.current_data[ch]["x"] = []
             self.current_data[ch]["y"] = []
             self.plotter.set_data(self.current_data)
+            self._refresh_grain_preview()
 
     def save_file(self):
         if not self.filepath:
             return
-
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Modified FGS", "modified_fgs.txt", "Text Files (*.txt)"
+            
+        errors = self._get_validation_errors()
+        if errors:
+            error_text = "\n".join(errors)
+            reply = QMessageBox.warning(
+                self, 
+                "Unsafe Preset", 
+                f"The current preset has stability or clipping issues:\n\n{error_text}\n\nAre you sure you want to save anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+        
+        p_params = self.sidebar.get_p_params() if self._current_event else None
+        from .fgs_save import save_static_fgs
+        saved = save_static_fgs(
+            self,
+            original_filepath=self.filepath,
+            scale_data=self.current_data,
+            p_params=p_params,
+            grain_size=self.sidebar.get_grain_size(),
+            autobalance=self.sidebar.get_autobalance(),
         )
-        if not save_path:
-            return
-
-        with open(self.filepath, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        for i, line in enumerate(lines):
-            tokens = line.strip().split()
-            if not tokens:
-                continue
-            prefix = tokens[0]
-            if prefix in ["sY", "sCb", "sCr"]:
-                data = self.current_data[prefix]
-                pts_count = len(data["x"])
-                if pts_count == 0:
-                    lines[i] = f"{prefix} 0\n"
-                else:
-                    pairs = []
-                    for x, y in zip(data["x"], data["y"]):
-                        pairs.extend([str(x), str(y)])
-                    lines[i] = f"{prefix} {pts_count} " + " ".join(pairs) + "\n"
-
-        with open(save_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-
-        QMessageBox.information(self, "Success", "File saved successfully!")
+        
+        if saved:
+            self.original_data = copy.deepcopy(self.current_data)
+            self.original_p_params = self.sidebar.get_p_params()
+            self.original_grain_size = self.sidebar.get_grain_size()
+            self._update_ui_state()
+        self._update_ui_state()
 
     def save_plot_as_png(self):
         save_path, _ = QFileDialog.getSaveFileName(
@@ -358,7 +513,7 @@ class MainUI(QMainWindow):
 
         ax.set_facecolor("#111111")
         styles = {
-            "sY": {"color": "#2ca02c", "label": "Luma (sY)", "marker": "o"},
+            "sY":  {"color": "#2ca02c", "label": "Luma (sY)",    "marker": "o"},
             "sCb": {"color": "#1f77b4", "label": "Chroma (sCb)", "marker": "s"},
             "sCr": {"color": "#d62728", "label": "Chroma (sCr)", "marker": "^"},
         }
@@ -385,7 +540,7 @@ class MainUI(QMainWindow):
 
         ax.set_title("Film Grain Strength - Saved Plot")
         ax.set_xlabel("Y Value")
-        ax.set_ylabel("Strength")
+        ax.set_ylabel("Strength (0-255)")
         ax.grid(True, linestyle="--", color="#444444", alpha=0.5)
 
         if has_data:
@@ -396,7 +551,7 @@ class MainUI(QMainWindow):
             ax.set_xticks([0, 16, 50, 100, 150, 200, 235, 255])
             ax.axvline(16, color="#555555", linestyle=":", alpha=0.5)
             ax.axvline(235, color="#555555", linestyle=":", alpha=0.5)
-            ax.axhline(100, color="#555555", linestyle=":", alpha=0.5)
+            ax.axhline(100, color="#f59e0b", linestyle=":", alpha=0.35, linewidth=0.9)
 
         fig.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)

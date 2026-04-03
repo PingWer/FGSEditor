@@ -1,12 +1,13 @@
 SHORTCUTS = [
-    ("Left Click + Drag", "Move point"),
-    ("Left Click + Shift", "Lock axis"),
-    ("Double Left Click", "Edit point"),
-    ("Right Click", "Add / Remove point"),
-    ("Middle Click + Drag", "Pan"),
-    ("CTRL + Scroll", "Zoom"),
-    ("CTRL + Z", "Undo"),
-    ("CTRL + Y", "Redo"),
+    ("Left Click + Drag", "Move point", ""),
+    ("Left Click + Shift", "Lock axis", ""),
+    ("Double Left Click", "Edit point", ""),
+    ("Right Click", "Add / Remove point", ""),
+    ("Middle Click + Drag", "Pan", " — In Event Editor Only"),
+    ("Right Click + Drag", "Pan", " — In Timeline Editor Only"),
+    ("CTRL + Scroll", "Zoom", ""),
+    ("CTRL + Z", "Undo", ""),
+    ("CTRL + Y", "Redo", ""),
 ]
 
 
@@ -16,7 +17,7 @@ def show_credits(parent=None):
     msg = QMessageBox(parent)
     msg.setWindowTitle(" ")
     msg.setText(
-        "FGSEditor v1.2.0\n\n"
+        "FGSEditor v2.0.0\n\n"
         'Copyright \u00a9 2026 Michele "PingWer" Cosentino\n\n'
         'Collaborators:\nManuel "Mhanz3500" Moscardi'
     )
@@ -54,8 +55,8 @@ def create_standard_menu(parent, show_credits_cb=None, open_github_cb=None):
 
     shortcuts_menu = QMenu("Shortcuts", menu_bar)
     shortcuts_menu.setStyleSheet("QMenu::item { font-size: 11px; }")
-    for label, desc in SHORTCUTS:
-        act = shortcuts_menu.addAction(f"{label}  —  {desc}")
+    for label, desc, other in SHORTCUTS:
+        act = shortcuts_menu.addAction(f"{label}  —  {desc}{other}")
         act.setEnabled(False)
     menu_bar.addMenu(shortcuts_menu)
 

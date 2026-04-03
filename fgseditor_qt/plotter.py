@@ -51,6 +51,8 @@ class InteractiveFGSPlotter(QWidget):
         self._is_panning = False
         self._pan_start_x = 0
         self._pan_start_y = 0
+        self._pan_start_xlim = None
+        self._pan_start_ylim = None
 
         self._user_xlim = None
         self._user_ylim = None
@@ -121,33 +123,41 @@ class InteractiveFGSPlotter(QWidget):
             return
 
         base_scale = 1.25
-        if event.button == "up":
-            scale_factor = 1 / base_scale
-        elif event.button == "down":
-            scale_factor = base_scale
-        else:
-            return
-
-        xdata = event.xdata
-        ydata = event.ydata
+        scale_factor = 1.0 / base_scale if event.button == "up" else base_scale
 
         cur_xlim = self.ax.get_xlim()
         cur_ylim = self.ax.get_ylim()
 
-        new_width = (cur_xlim[1] - cur_xlim[0]) * scale_factor
-        new_height = (cur_ylim[1] - cur_ylim[0]) * scale_factor
+        # Stable zoom using pixel-space relative position
+        bbox = self.ax.get_window_extent()
+        rel_x = (event.x - bbox.x0) / bbox.width
+        rel_y = (event.y - bbox.y0) / bbox.height
 
-        rel_x = (cur_xlim[1] - xdata) / (cur_xlim[1] - cur_xlim[0])
-        rel_y = (cur_ylim[1] - ydata) / (cur_ylim[1] - cur_ylim[0])
+        x_range = cur_xlim[1] - cur_xlim[0]
+        y_range = cur_ylim[1] - cur_ylim[0]
 
-        new_xlim = [xdata - new_width * (1 - rel_x), xdata + new_width * rel_x]
-        new_ylim = [ydata - new_height * (1 - rel_y), ydata + new_height * rel_y]
+        xdata_now = cur_xlim[0] + rel_x * x_range
+        ydata_now = cur_ylim[0] + rel_y * y_range
+
+        new_x_range = x_range * scale_factor
+        new_y_range = y_range * scale_factor
+
+        new_xlim = [xdata_now - new_x_range * rel_x, xdata_now + new_x_range * (1 - rel_x)]
+        new_ylim = [ydata_now - new_y_range * rel_y, ydata_now + new_y_range * (1 - rel_y)]
 
         self.ax.set_xlim(new_xlim)
         self.ax.set_ylim(new_ylim)
         self._user_xlim = tuple(new_xlim)
         self._user_ylim = tuple(new_ylim)
-        self.canvas.draw()
+        
+        # If user was panning, we must update the reference point to avoid jumps
+        if self._is_panning:
+            self._pan_start_x = event.x
+            self._pan_start_y = event.y
+            self._pan_start_xlim = tuple(new_xlim)
+            self._pan_start_ylim = tuple(new_ylim)
+
+        self.canvas.draw_idle()
 
     def set_active_channel(self, channel_name):
         self.active_channel = channel_name
@@ -209,7 +219,7 @@ class InteractiveFGSPlotter(QWidget):
                     markersize=6,
                     linewidth=2,
                     alpha=alpha,
-                    picker=5,
+                    picker=12,
                 )
                 self.lines[channel] = {"line": line, "data": data}
 
@@ -239,7 +249,7 @@ class InteractiveFGSPlotter(QWidget):
             self.ax.set_xticks([0, 16, 50, 100, 150, 200, 235, 255])
             self.ax.axvline(16, color="#555555", linestyle=":", alpha=0.5)
             self.ax.axvline(235, color="#555555", linestyle=":", alpha=0.5)
-            self.ax.axhline(100, color="#555555", linestyle=":", alpha=0.5)
+            self.ax.axhline(100, color="#f59e0b", linestyle=":", alpha=0.35, linewidth=0.9)
         else:
             self.ax.set_xlim(0, 255)
             self.ax.set_ylim(0, 150)
@@ -276,14 +286,13 @@ class InteractiveFGSPlotter(QWidget):
         found_idx = None
 
         for i in range(len(x_data)):
-            dx = x_data[i] - event.xdata
-            dy = y_data[i] - event.ydata
-            dist = (dx**2 + dy**2) ** 0.5
+            pt_px = self.ax.transData.transform((x_data[i], y_data[i]))
+            dist = ((pt_px[0] - event.x) ** 2 + (pt_px[1] - event.y) ** 2) ** 0.5
             if dist < min_dist:
                 min_dist = dist
                 found_idx = i
 
-        if found_idx is not None and min_dist < 1:
+        if found_idx is not None and min_dist <= 12:
             return found_idx
         return None
 
@@ -295,8 +304,10 @@ class InteractiveFGSPlotter(QWidget):
 
         if event.button == 2:
             self._is_panning = True
-            self._pan_start_x = event.xdata
-            self._pan_start_y = event.ydata
+            self._pan_start_x = event.x
+            self._pan_start_y = event.y
+            self._pan_start_xlim = self.ax.get_xlim()
+            self._pan_start_ylim = self.ax.get_ylim()
             return
 
         if event.dblclick and event.button == 1:
@@ -339,7 +350,7 @@ class InteractiveFGSPlotter(QWidget):
                     QMessageBox.warning(self, "Limit", "You cannot exceed 14 points.")
                 else:
                     new_x = max(16, min(235, x_val))
-                    new_y = max(0, min(100, y_val))
+                    new_y = max(0, min(255, y_val))
 
                     if new_x in self.current_data[ch]["x"]:
                         QMessageBox.warning(
@@ -382,7 +393,7 @@ class InteractiveFGSPlotter(QWidget):
         form_layout.addLayout(x_layout)
 
         y_layout = QHBoxLayout()
-        y_layout.addWidget(QLabel("Y Strength (0 - 100):"))
+        y_layout.addWidget(QLabel("Y Strength (0 - 255):"))
         y_input = QLineEdit(str(curr_y))
         y_layout.addWidget(y_input)
         form_layout.addLayout(y_layout)
@@ -401,9 +412,9 @@ class InteractiveFGSPlotter(QWidget):
                         f"X value must be between {min_x} and {max_x}.",
                     )
                     return
-                if not (0 <= new_y <= 100):
+                if not (0 <= new_y <= 255):
                     QMessageBox.warning(
-                        dialog, "Y Error", "Y strength must be between 0 and 100."
+                        dialog, "Y Error", "Y strength must be between 0 and 255."
                     )
                     return
 
@@ -446,17 +457,24 @@ class InteractiveFGSPlotter(QWidget):
 
     def on_motion(self, event):
         if self._is_panning and event.inaxes == self.ax:
-            dx = event.xdata - self._pan_start_x
-            dy = event.ydata - self._pan_start_y
-            cur_xlim = self.ax.get_xlim()
-            cur_ylim = self.ax.get_ylim()
-            new_xlim = (cur_xlim[0] - dx, cur_xlim[1] - dx)
-            new_ylim = (cur_ylim[0] - dy, cur_ylim[1] - dy)
+            bbox = self.ax.get_window_extent()
+            dx_pixels = event.x - self._pan_start_x
+            dy_pixels = event.y - self._pan_start_y
+            
+            cur_xlim = self._pan_start_xlim
+            cur_ylim = self._pan_start_ylim
+            
+            dx_data = dx_pixels * ((cur_xlim[1] - cur_xlim[0]) / bbox.width)
+            dy_data = dy_pixels * ((cur_ylim[1] - cur_ylim[0]) / bbox.height)
+
+            new_xlim = (cur_xlim[0] - dx_data, cur_xlim[1] - dx_data)
+            new_ylim = (cur_ylim[0] - dy_data, cur_ylim[1] - dy_data)
+            
             self.ax.set_xlim(new_xlim)
             self.ax.set_ylim(new_ylim)
             self._user_xlim = new_xlim
             self._user_ylim = new_ylim
-            self.canvas.draw()
+            self.canvas.draw_idle()
             return
 
         if self.drag_point_index is None:
@@ -509,7 +527,7 @@ class InteractiveFGSPlotter(QWidget):
             self._drag_lock_axis = None
 
         new_x = max(min_x, min(max_x, raw_x))
-        new_y = max(0, min(100, raw_y))
+        new_y = max(0, min(255, raw_y))
 
         data["x"][idx] = new_x
         data["y"][idx] = new_y
@@ -526,6 +544,7 @@ class InteractiveFGSPlotter(QWidget):
         self.canvas.setFocus()
 
     def on_leave(self, event):
+        self._is_panning = False
         if self.annot.get_visible():
             self.annot.set_visible(False)
             self.canvas.draw_idle()

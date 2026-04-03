@@ -30,7 +30,7 @@ You can find me in the [AV1 Weeb Discord Server](https://discord.gg/bZPrC2cmP6)
 ## 📋 Roadmap & TODO
 - [ ] Add the ability to insert new events into a dynamic FGS.
 - [ ] Implement automatic FGS optimization.
-- [ ] Add built-in presets for various types of grain/events.
+- [x] Add built-in presets for various types of grain/events.
 - [x] Add Linux support
 
 ## 🔮 Future Expansions

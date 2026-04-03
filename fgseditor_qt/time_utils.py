@@ -36,3 +36,27 @@ def ticks_to_seconds(ticks: int) -> float:
 
 def seconds_to_ticks(seconds: float) -> int:
     return round(seconds * TICKS_PER_SECOND)
+
+
+def ticks_to_timecode(ticks: int) -> str:
+    total_ms = ticks // 10_000  # 10^7 ticks/s → 10^3 ms/s
+    ms = total_ms % 1_000
+    total_s = total_ms // 1_000
+    secs = total_s % 60
+    total_m = total_s // 60
+    mins = total_m % 60
+    hours = total_m // 60
+    return f"{hours:02d}:{mins:02d}:{secs:02d}:{ms:03d}"
+    
+
+def timecode_to_ticks(tc: str) -> int:
+    """Converts HH:MM:SS:mmm back to ticks (10^-7 seconds)."""
+    try:
+        parts = tc.split(":")
+        if len(parts) != 4:
+            return 0
+        h, m, s, ms = map(int, parts)
+        total_ms = (h * 3600 + m * 60 + s) * 1000 + ms
+        return total_ms * 10_000
+    except ValueError:
+        return 0

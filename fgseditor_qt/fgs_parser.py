@@ -1,4 +1,5 @@
 import os
+from .fgs_math import parse_p_row
 
 
 def _parse_scale_from_lines(lines):
@@ -26,6 +27,15 @@ def parse_fgs_scale(fgs_text):
     return _parse_scale_from_lines(fgs_text.strip().split("\n"))
 
 
+def _extract_p_params(raw_lines: list[str]) -> dict | None:
+    """Scan raw_lines for a 'p' row and return parsed p_params dict, or None."""
+    for raw_line in raw_lines:
+        tokens = raw_line.strip().split()
+        if tokens and tokens[0] == "p":
+            return parse_p_row(tokens[1:])
+    return None
+
+
 def parse_fgs_events(content):
     lines = content.splitlines(keepends=True)
     events = []
@@ -41,6 +51,7 @@ def parse_fgs_events(content):
                 current_event["scale_data"] = _parse_scale_from_lines(
                     [line_text.strip() for line_text in current_event["raw_lines"]]
                 )
+                current_event["p_params"] = _extract_p_params(current_event["raw_lines"])
                 events.append(current_event)
 
             start_t = int(tokens[1])
@@ -52,6 +63,7 @@ def parse_fgs_events(content):
                 "extra_params": tokens[3:],
                 "raw_lines": [],
                 "scale_data": None,
+                "p_params": None,
             }
         elif current_event is not None:
             current_event["raw_lines"].append(line)
@@ -62,6 +74,7 @@ def parse_fgs_events(content):
         current_event["scale_data"] = _parse_scale_from_lines(
             [line_text.strip() for line_text in current_event["raw_lines"]]
         )
+        current_event["p_params"] = _extract_p_params(current_event["raw_lines"])
         events.append(current_event)
 
     return header_lines, events
