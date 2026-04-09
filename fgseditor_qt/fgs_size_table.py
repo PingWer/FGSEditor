@@ -1,9 +1,17 @@
 from __future__ import annotations
 import os
+import sys
 
 
-_TABLE_DIR = os.path.join(os.path.dirname(__file__), "..", "FGS_size_table")
-_TABLE_DIR = os.path.normpath(_TABLE_DIR)
+def _get_table_dir() -> str:
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.join(os.path.dirname(__file__), "..")
+    return os.path.normpath(os.path.join(base, "FGS_size_table"))
+
+
+_TABLE_DIR = _get_table_dir()
 
 
 def _parse_coeffs(line: str) -> list[int]:
@@ -40,6 +48,8 @@ def load_size_preset(size_index: int) -> dict | None:
         'cCr'       : list[int]
     Returns None if the file does not exist.
     """
+    if not os.path.isdir(_TABLE_DIR):
+        return None
     path = os.path.join(_TABLE_DIR, f"{size_index}.txt")
     if not os.path.isfile(path):
         return None
@@ -66,6 +76,8 @@ def load_size_preset(size_index: int) -> dict | None:
 
 
 def available_sizes() -> list[int]:
+    if not os.path.isdir(_TABLE_DIR):
+        return []
     sizes = []
     for fname in os.listdir(_TABLE_DIR):
         base, ext = os.path.splitext(fname)
