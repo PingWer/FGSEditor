@@ -1,17 +1,9 @@
 from __future__ import annotations
 import os
-import sys
+from .app_paths import get_base_dir
 
 
-def _get_table_dir() -> str:
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.join(os.path.dirname(__file__), "..")
-    return os.path.normpath(os.path.join(base, "FGS_size_table"))
-
-
-_TABLE_DIR = _get_table_dir()
+_TABLE_DIR = os.path.normpath(os.path.join(get_base_dir(), "FGS_size_table"))
 
 
 def _parse_coeffs(line: str) -> list[int]:

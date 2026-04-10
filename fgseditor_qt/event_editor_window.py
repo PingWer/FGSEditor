@@ -28,12 +28,14 @@ class EventEditorUI(QDialog):
         self.event_dict = event_data["event"]
         self.event_idx = event_data["event_idx"]
 
+        self._working = copy.deepcopy(self.event_dict)
+
         self.setWindowTitle(f"Edit FGS Event {self.event_idx + 1}")
         self.setMinimumSize(1000, 650)
         self.setAttribute(Qt.WA_DeleteOnClose)
 
-        self.original_scale_data = copy.deepcopy(self.event_dict["scale_data"])
-        self.current_scale_data = copy.deepcopy(self.event_dict["scale_data"])
+        self.original_scale_data = copy.deepcopy(self._working["scale_data"])
+        self.current_scale_data = copy.deepcopy(self._working["scale_data"])
         self.original_p_params = {}
         self.original_grain_size = 0
 
@@ -97,12 +99,11 @@ class EventEditorUI(QDialog):
         h_splitter.setStyleSheet("QSplitter::handle { background: #333355; }")
         layout.addWidget(h_splitter, stretch=1)
 
-        # Sidebar
+        # Sidebar — populated from the working copy
         self.sidebar = ParamsSidebar()
         self.sidebar.params_changed.connect(self._on_params_changed)
         self.sidebar.grain_size_changed.connect(self._on_grain_size_changed)
-        # Populate from this event's p_params
-        self.sidebar.load_from_event(self.event_dict, size_id=-1)
+        self.sidebar.load_from_event(self._working, size_id=-1)
         h_splitter.addWidget(self.sidebar)
 
         # Right: vertical splitter (main plot | grain preview)
@@ -168,21 +169,20 @@ class EventEditorUI(QDialog):
         self._update_ui_state()
 
     def _on_params_changed(self, p_params: dict):
-        self.event_dict["p_params"] = p_params
+        # Update working copy only
+        self._working["p_params"] = p_params
         self._refresh_grain_preview(p_params=p_params)
         self._update_ui_state()
 
     def _on_grain_size_changed(self, size: int):
         from .fgs_size_table import apply_size_preset_to_event
 
-        apply_size_preset_to_event(self.event_dict, size)
-        # Sync sidebar UI with the new p_params from the preset, keeping the selected size_id
-        self.sidebar.load_from_event(self.event_dict, size_id=size)
+        apply_size_preset_to_event(self._working, size)
+        self.sidebar.load_from_event(self._working, size_id=size)
         self._refresh_grain_preview(grain_size=size)
         self._update_ui_state()
 
     def is_dirty(self) -> bool:
-        """Check if any data or parameters have changed from the original markers."""
         if self.current_scale_data != self.original_scale_data:
             return True
         if self.sidebar.get_p_params() != self.original_p_params:
@@ -204,7 +204,7 @@ class EventEditorUI(QDialog):
         )
 
         cy_coeffs, cb_coeffs, cr_coeffs = extract_ar_coeffs_from_raw_lines(
-            self.event_dict.get("raw_lines", [])
+            self._working.get("raw_lines", [])
         )
 
         all_errors = []
@@ -258,7 +258,7 @@ class EventEditorUI(QDialog):
         from .fgs_math import extract_ar_coeffs_from_raw_lines
 
         cy_coeffs, cb_coeffs, cr_coeffs = extract_ar_coeffs_from_raw_lines(
-            self.event_dict.get("raw_lines", [])
+            self._working.get("raw_lines", [])
         )
         self.grain_preview.update_preview(
             self.current_scale_data,
@@ -283,7 +283,6 @@ class EventEditorUI(QDialog):
             )
             if reply == QMessageBox.Save:
                 self.save_event()
-                # self.save_event() calls self.accept(), which closes the dialog
             elif reply == QMessageBox.Discard:
                 if self.plotter:
                     self.plotter.close_plot()
@@ -311,18 +310,17 @@ class EventEditorUI(QDialog):
             if reply == QMessageBox.No:
                 return
 
-        self.dynamic_timeline_ui._push_undo()
-        self.event_dict["scale_data"] = copy.deepcopy(self.current_scale_data)
+        self._working["scale_data"] = copy.deepcopy(self.current_scale_data)
+        self._working["p_params"] = self.sidebar.get_p_params()
+        self._working["grain_size"] = self.sidebar.get_grain_size()
+        self.event_dict.update(self._working)
 
-        # Persist sidebar parameters back into the event so dynamic save picks them up
-        self.event_dict["p_params"] = self.sidebar.get_p_params()
-        self.event_dict["grain_size"] = self.sidebar.get_grain_size()
+        self.dynamic_timeline_ui._push_undo()
 
         from .fgs_parser import avg_sy_strength
 
         new_strength = avg_sy_strength(self.event_dict)
 
-        # Reset originals
         self.original_scale_data = copy.deepcopy(self.current_scale_data)
         self.original_p_params = self.sidebar.get_p_params()
         self.original_grain_size = self.sidebar.get_grain_size()
@@ -335,4 +333,5 @@ class EventEditorUI(QDialog):
         )
 
         self.dynamic_timeline_ui.build_timeline()
+        self.dynamic_timeline_ui._update_ui_state()
         self.accept()

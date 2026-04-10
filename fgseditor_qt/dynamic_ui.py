@@ -21,6 +21,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.collections import LineCollection
 import numpy as np
 from . import fgs_parser
+from .app_paths import get_base_dir
 from .shortcuts import create_standard_menu
 from .time_utils import (
     COMMON_FPS,
@@ -693,7 +694,7 @@ class DynamicTimelineUI(QWidget):
 
     def save_plot_as_png(self):
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Plot", "timeline.png", "PNG (*.png)"
+            self, "Save Plot", os.path.join(get_base_dir(), "timeline.png"), "PNG (*.png)"
         )
         if save_path:
             self.figure.savefig(save_path, dpi=300, bbox_inches="tight")

@@ -1,5 +1,7 @@
 from __future__ import annotations
+import os
 from PySide6.QtWidgets import QFileDialog, QMessageBox
+from .app_paths import get_base_dir
 
 
 def _build_scale_line(prefix: str, data: dict) -> str:
@@ -116,8 +118,9 @@ def save_fgs(
     autobalance: bool = False,
     default_name: str = "modified_fgs.txt",
 ) -> bool:
+    default_path = os.path.join(get_base_dir(), default_name)
     save_path, _ = QFileDialog.getSaveFileName(
-        parent_widget, "Save FGS File", default_name, "Text Files (*.txt)"
+        parent_widget, "Save FGS File", default_path, "Text Files (*.txt)"
     )
     if not save_path:
         return False
@@ -131,6 +134,25 @@ def save_fgs(
     return True
 
 
+def save_dynamic_fgs(
+    parent_widget,
+    original_filepath: str,
+    header_lines: list[str],
+    events: list[dict],
+    autobalance: bool = False,
+    default_name: str = "modified_fgs.txt",
+) -> bool:
+    return save_fgs(
+        parent_widget,
+        header_lines=header_lines,
+        events=events,
+        autobalance=autobalance,
+        default_name=os.path.basename(original_filepath)
+        if original_filepath
+        else default_name,
+    )
+
+
 def save_static_fgs(
     parent_widget,
     original_filepath: str,
@@ -140,8 +162,9 @@ def save_static_fgs(
     autobalance: bool = False,
     default_name: str = "modified_fgs.txt",
 ) -> bool:
+    default_path = os.path.join(get_base_dir(), default_name)
     save_path, _ = QFileDialog.getSaveFileName(
-        parent_widget, "Save Modified FGS", default_name, "Text Files (*.txt)"
+        parent_widget, "Save Modified FGS", default_path, "Text Files (*.txt)"
     )
     if not save_path:
         return False

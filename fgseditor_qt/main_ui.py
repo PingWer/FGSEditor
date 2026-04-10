@@ -1,3 +1,4 @@
+import os
 import copy
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from . import fgs_parser
+from .app_paths import get_base_dir
 from .plotter import InteractiveFGSPlotter
 from .grain_preview import GrainPreviewPlotter
 from .params_sidebar import ParamsSidebar
@@ -378,7 +380,7 @@ class MainUI(QMainWindow):
 
     def load_file(self):
         filename, _ = QFileDialog.getOpenFileName(
-            self, "Select FGS file", "", "Text Files (*.txt)"
+            self, "Select FGS file", get_base_dir(), "Text Files (*.txt)"
         )
         if not filename:
             return
@@ -501,7 +503,7 @@ class MainUI(QMainWindow):
 
     def save_plot_as_png(self):
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Plot as PNG", "plot.png", "PNG Images (*.png)"
+            self, "Save Plot as PNG", os.path.join(get_base_dir(), "plot.png"), "PNG Images (*.png)"
         )
         if not save_path:
             return
