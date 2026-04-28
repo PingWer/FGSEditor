@@ -104,6 +104,59 @@ def setup_dark_theme(app: QApplication):
             outline: 0px;
         }
         QToolTip { color: #ffffff; background-color: #2a82da; border: 1px solid #4da6ff; padding: 4px; border-radius: 4px; }
+        
+        QCheckBox {
+            spacing: 8px;
+            color: #dddddd;
+            font-size: 13px;
+        }
+        QCheckBox::indicator {
+            width: 18px;
+            height: 18px;
+            background-color: #2d2d2d;
+            border: 1px solid #444444;
+            border-radius: 4px;
+        }
+        QCheckBox::indicator:hover {
+            border: 1px solid #4da6ff;
+            background-color: #353535;
+        }
+        QCheckBox::indicator:checked {
+            background-color: #2a82da;
+            border: 1px solid #4da6ff;
+            image: url(none); /* Fallback to handle some systems */
+        }
+        QCheckBox::indicator:checked:hover {
+            background-color: #3b93eb;
+            border: 1px solid #80bdff;
+        }
+        /* Custom checkmark alternative if no image: we use the background color change + border */
+        
+        QRadioButton {
+            spacing: 8px;
+            color: #dddddd;
+            font-size: 13px;
+        }
+        QRadioButton::indicator {
+            width: 18px;
+            height: 18px;
+            background-color: #2d2d2d;
+            border: 1px solid #444444;
+            border-radius: 9px; /* Circular */
+        }
+        QRadioButton::indicator:hover {
+            border: 1px solid #4da6ff;
+            background-color: #353535;
+        }
+        QRadioButton::indicator:checked {
+            background-color: #2a82da;
+            border: 1px solid #4da6ff;
+            image: url(none);
+        }
+        QRadioButton::indicator:checked:hover {
+            background-color: #3b93eb;
+            border: 1px solid #80bdff;
+        }
     """)
 
 
@@ -112,7 +165,7 @@ def main():
         import ctypes
 
         try:
-            myappid = "PingWer.fgseditor.2.1"
+            myappid = "PingWer.fgseditor.3.0"
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except Exception:
             pass

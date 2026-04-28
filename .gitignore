@@ -1,6 +1,8 @@
 *.exe
+!grav1synth.exe
 /build
 /dist
 /.venv
 /fgseditor_qt/__pycache__
 *.spec
+*.pyc

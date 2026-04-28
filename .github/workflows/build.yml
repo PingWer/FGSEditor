@@ -27,7 +27,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install PySide6 matplotlib numpy zstandard Nuitka
+          python -m pip install PySide6 matplotlib numpy Nuitka
           python -m pip install .
 
       - name: Cache Nuitka
@@ -46,8 +46,8 @@ jobs:
             --windows-icon-from-ico=icon.ico ^
             --windows-company-name="PingWer" ^
             --windows-product-name="FGSEditor" ^
-            --windows-file-version="1.0.0.0" ^
-            --windows-product-version="1.0.0.0" ^
+            --windows-file-version="3.0.0.0" ^
+            --windows-product-version="3.0.0.0" ^
             --windows-file-description="Film Grain Strength Editor" ^
             --output-dir=dist fgseditor_qt/fgsview_loader.py ^
             --include-package=fgseditor_qt ^
@@ -61,7 +61,11 @@ jobs:
         run: |
           mkdir release
           Move-Item -Path dist/fgsview_loader.dist -Destination release/FGSEditor
-          Copy-Item -Path FGS_size_table -Destination release/FGSEditor/FGS_size_table -Recurse
+          Copy-Item -Path FGS_grain_size  -Destination release/FGSEditor/FGS_grain_size  -Recurse
+          Copy-Item -Path FGS_size_table  -Destination release/FGSEditor/FGS_size_table  -Recurse
+          Copy-Item -Path Templates       -Destination release/FGSEditor/Templates        -Recurse
+          Copy-Item -Path grav1synth.exe  -Destination release/FGSEditor/grav1synth.exe
+          Copy-Item -Path NOTICE.md       -Destination release/FGSEditor/NOTICE.md
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -107,10 +111,13 @@ jobs:
 
       - name: Prepare artifact
         run: |
-          mkdir -p release
-          cp dist/FGSEditor release/
-          cp -r FGS_size_table release/
-          chmod +x release/FGSEditor
+          mkdir -p release/FGSEditor
+          cp dist/FGSEditor release/FGSEditor/
+          cp -r FGS_grain_size  release/FGSEditor/FGS_grain_size
+          cp -r FGS_size_table  release/FGSEditor/FGS_size_table
+          cp -r Templates       release/FGSEditor/Templates
+          cp    NOTICE.md       release/FGSEditor/NOTICE.md
+          chmod +x release/FGSEditor/FGSEditor
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

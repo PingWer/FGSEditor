@@ -1,5 +1,4 @@
 import copy
-from collections import deque
 from PySide6.QtWidgets import QWidget, QVBoxLayout
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeyEvent
@@ -10,6 +9,9 @@ from matplotlib.ticker import MaxNLocator
 
 class InteractiveFGSPlotter(QWidget):
     data_changed = Signal()
+    undo_push_requested = Signal(object)
+    undo_requested = Signal()
+    redo_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -35,7 +37,6 @@ class InteractiveFGSPlotter(QWidget):
         }
 
         self.active_channel = "sY"
-        self.base_data = {}
         self.current_data = {
             "sY": {"x": [], "y": []},
             "sCb": {"x": [], "y": []},
@@ -57,8 +58,12 @@ class InteractiveFGSPlotter(QWidget):
         self._user_xlim = None
         self._user_ylim = None
 
-        self._undo_stack: deque = deque(maxlen=100)
-        self._redo_stack: deque = deque(maxlen=100)
+        self._user_ylim = None
+
+        # Clipping alert data: set from outside via set_clip_extremes()
+        self._clip_extremes: dict | None = None
+        self._clip_scaling_shift: int = 8
+        self._is_chroma_linked: bool = False
 
         self.annot = self.ax.annotate(
             "",
@@ -80,39 +85,22 @@ class InteractiveFGSPlotter(QWidget):
         self.canvas.mpl_connect("axes_leave_event", self.on_leave)
         self.canvas.mpl_connect("key_press_event", self._on_mpl_key_press)
 
-    def _push_undo(self):
-        self._undo_stack.append(copy.deepcopy(self.current_data))
-        self._redo_stack.clear()
+    def _push_undo(self, old_data=None):
+        self.undo_push_requested.emit(old_data)
 
     def _on_mpl_key_press(self, event):
         if event.key == "ctrl+z":
-            self.undo()
+            self.undo_requested.emit()
         elif event.key == "ctrl+y":
-            self.redo()
-
-    def undo(self):
-        if not self._undo_stack:
-            return
-        self._redo_stack.append(copy.deepcopy(self.current_data))
-        self.current_data = self._undo_stack.pop()
-        self.refresh()
-        self.data_changed.emit()
-
-    def redo(self):
-        if not self._redo_stack:
-            return
-        self._undo_stack.append(copy.deepcopy(self.current_data))
-        self.current_data = self._redo_stack.pop()
-        self.refresh()
-        self.data_changed.emit()
+            self.redo_requested.emit()
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.modifiers() == Qt.ControlModifier:
             if event.key() == Qt.Key_Z:
-                self.undo()
+                self.undo_requested.emit()
                 return
             if event.key() == Qt.Key_Y:
-                self.redo()
+                self.redo_requested.emit()
                 return
         super().keyPressEvent(event)
 
@@ -142,15 +130,20 @@ class InteractiveFGSPlotter(QWidget):
         new_x_range = x_range * scale_factor
         new_y_range = y_range * scale_factor
 
-        new_xlim = [xdata_now - new_x_range * rel_x, xdata_now + new_x_range * (1 - rel_x)]
-        new_ylim = [ydata_now - new_y_range * rel_y, ydata_now + new_y_range * (1 - rel_y)]
+        new_xlim = [
+            xdata_now - new_x_range * rel_x,
+            xdata_now + new_x_range * (1 - rel_x),
+        ]
+        new_ylim = [
+            ydata_now - new_y_range * rel_y,
+            ydata_now + new_y_range * (1 - rel_y),
+        ]
 
         self.ax.set_xlim(new_xlim)
         self.ax.set_ylim(new_ylim)
         self._user_xlim = tuple(new_xlim)
         self._user_ylim = tuple(new_ylim)
-        
-        # If user was panning, we must update the reference point to avoid jumps
+
         if self._is_panning:
             self._pan_start_x = event.x
             self._pan_start_y = event.y
@@ -164,15 +157,11 @@ class InteractiveFGSPlotter(QWidget):
         self.refresh()
 
     def set_data(self, data_dict):
-        self.base_data = copy.deepcopy(data_dict)
         self.current_data = copy.deepcopy(data_dict)
 
         for ch in ["sY", "sCb", "sCr"]:
             if ch not in self.current_data:
                 self.current_data[ch] = {"x": [], "y": []}
-
-        self._undo_stack.clear()
-        self._redo_stack.clear()
 
         self._user_xlim = None
         self._user_ylim = None
@@ -183,14 +172,19 @@ class InteractiveFGSPlotter(QWidget):
         self.ax.clear()
         self.figure.clear()
         self.canvas.deleteLater()
-        # Avoids memory leaks
         self.annot = None
         self.ax = None
         self.figure = None
         self.canvas = None
         self.lines = {}
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+
+    def set_clip_extremes(self, extremes: dict | None, scaling_shift: int = 8) -> None:
+        self._clip_extremes = extremes
+        self._clip_scaling_shift = scaling_shift
+
+    def set_chroma_linked(self, linked: bool) -> None:
+        self._is_chroma_linked = linked
+        self.refresh()
 
     def refresh(self):
         self.ax.clear()
@@ -243,13 +237,38 @@ class InteractiveFGSPlotter(QWidget):
 
         self.ax.grid(True, linestyle="--", color="#444444", alpha=0.5)
 
+        if self._is_chroma_linked and self.active_channel in ("sCb", "sCr"):
+            self.ax.text(
+                0.5,
+                0.95,
+                "LINKED TO LUMA (Read-Only)",
+                transform=self.ax.transAxes,
+                color="#4da6ff",
+                fontweight="bold",
+                ha="center",
+                va="top",
+                bbox=dict(
+                    facecolor="#1a1a2e",
+                    alpha=0.8,
+                    edgecolor="#4da6ff",
+                    boxstyle="round,pad=0.5",
+                ),
+            )
+
         if has_data:
             y_margin = max(5, (max_y - min_y) * 0.15)
             self.ax.legend()
+            self.ax.legend()
             self.ax.set_xticks([0, 16, 50, 100, 150, 200, 235, 255])
-            self.ax.axvline(16, color="#555555", linestyle=":", alpha=0.5)
-            self.ax.axvline(235, color="#555555", linestyle=":", alpha=0.5)
-            self.ax.axhline(100, color="#f59e0b", linestyle=":", alpha=0.35, linewidth=0.9)
+
+            self.ax.axvspan(0, 16, color="#ff0000", alpha=0.04, zorder=0)
+            self.ax.axvspan(235, 255, color="#ff0000", alpha=0.04, zorder=0)
+
+            self.ax.axvline(16, color="#ff4444", linestyle=":", alpha=0.3)
+            self.ax.axvline(235, color="#ff4444", linestyle=":", alpha=0.3)
+            self.ax.axhline(
+                100, color="#f59e0b", linestyle=":", alpha=0.35, linewidth=0.9
+            )
         else:
             self.ax.set_xlim(0, 255)
             self.ax.set_ylim(0, 150)
@@ -263,7 +282,55 @@ class InteractiveFGSPlotter(QWidget):
             self.ax.set_xlim(0, 255)
             self.ax.set_ylim(min_y - y_margin, max_y + y_margin)
 
+        if self._clip_extremes and has_data:
+            self._draw_clip_alerts()
+
         self.canvas.draw()
+
+    def _draw_clip_alerts(self) -> None:
+        from .fgs_grain_sim import compute_amplitude_at_point
+
+        ext = self._clip_extremes
+        s_shift = self._clip_scaling_shift
+
+        channel_configs = {
+            "sY": ("luma_max", "luma_min", 16, 235),
+            "sCb": ("cb_max", "cb_min", 16, 235),
+            "sCr": ("cr_max", "cr_min", 16, 235),
+        }
+
+        for channel, data in self.current_data.items():
+            if not data["x"]:
+                continue
+            config = channel_configs.get(channel)
+            if not config:
+                continue
+            max_key, min_key, l_min, l_max = config
+            grain_max = ext.get(max_key, 0)
+            grain_min = ext.get(min_key, 0)
+
+            clip_x = []
+            clip_y = []
+            for px, py in zip(data["x"], data["y"]):
+                d_max = compute_amplitude_at_point(grain_max, py, s_shift)
+                d_min = compute_amplitude_at_point(grain_min, py, s_shift)
+
+                if (px + d_max) > l_max or (px + d_min) < l_min:
+                    clip_x.append(px)
+                    clip_y.append(py)
+
+            if clip_x:
+                self.ax.scatter(
+                    clip_x,
+                    clip_y,
+                    marker="v",
+                    s=80,
+                    c="#ff4444",
+                    edgecolors="#ff8800",
+                    linewidths=1.5,
+                    zorder=8,
+                    label="_clip" if channel != "sY" else "⚠ clips",
+                )
 
     def get_point_constraints(self, channel, idx):
         x_list = self.current_data[channel]["x"]
@@ -301,6 +368,11 @@ class InteractiveFGSPlotter(QWidget):
 
         if event.inaxes != self.ax:
             return
+
+        # If linked, block edits to Chroma
+        if self._is_chroma_linked and self.active_channel in ("sCb", "sCr"):
+            if event.button != 2:  # Allow middle-click pan
+                return
 
         if event.button == 2:
             self._is_panning = True
@@ -448,8 +520,7 @@ class InteractiveFGSPlotter(QWidget):
                 snapshot = copy.deepcopy(self.current_data)
                 snapshot[ch]["x"][idx] = self._drag_start_x
                 snapshot[ch]["y"][idx] = self._drag_start_y
-                self._undo_stack.append(snapshot)
-                self._redo_stack.clear()
+                self.undo_push_requested.emit(snapshot)
 
             self.drag_point_index = None
             self._drag_lock_axis = None
@@ -460,16 +531,16 @@ class InteractiveFGSPlotter(QWidget):
             bbox = self.ax.get_window_extent()
             dx_pixels = event.x - self._pan_start_x
             dy_pixels = event.y - self._pan_start_y
-            
+
             cur_xlim = self._pan_start_xlim
             cur_ylim = self._pan_start_ylim
-            
+
             dx_data = dx_pixels * ((cur_xlim[1] - cur_xlim[0]) / bbox.width)
             dy_data = dy_pixels * ((cur_ylim[1] - cur_ylim[0]) / bbox.height)
 
             new_xlim = (cur_xlim[0] - dx_data, cur_xlim[1] - dx_data)
             new_ylim = (cur_ylim[0] - dy_data, cur_ylim[1] - dy_data)
-            
+
             self.ax.set_xlim(new_xlim)
             self.ax.set_ylim(new_ylim)
             self._user_xlim = new_xlim

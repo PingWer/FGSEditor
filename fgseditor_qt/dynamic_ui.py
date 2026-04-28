@@ -12,15 +12,16 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QFrame,
     QMenu,
-    QCheckBox,
     QComboBox,
     QLineEdit,
 )
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.collections import LineCollection
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 from . import fgs_parser
+from . import fgs_math
 from .app_paths import get_base_dir
 from .shortcuts import create_standard_menu
 from .time_utils import (
@@ -31,6 +32,8 @@ from .time_utils import (
     frames_to_ticks,
     ticks_to_timecode,
     timecode_to_ticks,
+    ticks_to_seconds,
+    seconds_to_ticks,
 )
 from PySide6.QtCore import Qt
 
@@ -51,7 +54,6 @@ class DynamicTimelineUI(QWidget):
         self.filepath = file_data["filepath"]
         self.header_lines = file_data["header_lines"]
 
-        self.original_autobalance = False
         self.original_fps_text = DEFAULT_FPS_LABEL
 
         self._undo_stack = deque(maxlen=100)
@@ -116,20 +118,25 @@ class DynamicTimelineUI(QWidget):
         self.fps_combo.setToolTip(
             "Frame rate used to display and input event timestamps as frame numbers"
         )
-        self.fps_combo.currentTextChanged.connect(self._update_ui_state)
+        self.fps_combo.currentTextChanged.connect(self._on_fps_changed)
         mid_layout.addWidget(self.fps_combo, stretch=0)
 
-        self.autobalance_chk = QCheckBox("Strength Autobalance")
-        self.autobalance_chk.setChecked(False)
-        self.autobalance_chk.setStyleSheet("color: #aaaaaa;")
-        self.autobalance_chk.setToolTip(
-            "When ON (default), all events are scaled during save to ensure\n"
-            "consistent perceived grain strength across different grain sizes."
+        time_format_label = QLabel("Time Format:")
+        time_format_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        mid_layout.addWidget(time_format_label, stretch=0)
+
+        self.time_format_combo = QComboBox()
+        self.time_format_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.time_format_combo.addItems(["Seconds", "Frames", "Timestamp"])
+        self.time_format_combo.setCurrentText("Seconds")
+        self.time_format_combo.setToolTip(
+            "Display timeline in seconds, frames (based on FPS), or HH:MM:SS:mmm format"
         )
-        self.autobalance_chk.stateChanged.connect(self._update_ui_state)
-        mid_layout.addWidget(self.autobalance_chk, stretch=0)
+        self.time_format_combo.currentTextChanged.connect(self._on_time_format_changed)
+        mid_layout.addWidget(self.time_format_combo, stretch=0)
 
         self.validation_warning_label = QLabel()
+
         self.validation_warning_label.setStyleSheet(
             "color: #ff4444; font-weight: bold; background: #220000; padding: 2px 6px; border-radius: 4px;"
         )
@@ -174,32 +181,21 @@ class DynamicTimelineUI(QWidget):
         self._update_ui_state()
 
     def is_dirty(self) -> bool:
-        """Full check: events, FPS, and Autobalance flag."""
+        """Full check: events and FPS text."""
         if self.events != self.original_events:
-            return True
-        if self.autobalance_chk.isChecked() != self.original_autobalance:
             return True
         if self.fps_combo.currentText() != self.original_fps_text:
             return True
         return False
 
     def _get_validation_errors(self) -> list[str]:
-        from .fgs_math import (
-            extract_ar_coeffs_from_raw_lines,
-            compute_export_scale_factor,
-            validate_fgs_pipeline,
-        )
-
         all_errors = []
-        autobalance = self.autobalance_chk.isChecked()
 
         for idx, ev in enumerate(self.events):
-            p_params = ev.get("p_params", {})
-            grain_size = ev.get("grain_size", p_params.get("grain_size", 1))
-            ar_shift = p_params.get("ar_coeff_shift", 8)
+            ar_shift = fgs_parser.get_ar_coeff_shift(ev)
 
-            cy_coeffs, cb_coeffs, cr_coeffs = extract_ar_coeffs_from_raw_lines(
-                ev.get("raw_lines", [])
+            cy_coeffs, cb_coeffs, cr_coeffs = (
+                fgs_parser.extract_ar_coeffs_from_raw_lines(ev.get("raw_lines", []))
             )
 
             ev_has_errors = False
@@ -208,14 +204,14 @@ class DynamicTimelineUI(QWidget):
                 ("Cb", cb_coeffs, "sCb"),
                 ("Cr", cr_coeffs, "sCr"),
             ]:
-                ys = ev.get("scale_data", {}).get(ch_key, {}).get("y", [])
-                export_scale = (
-                    compute_export_scale_factor(grain_size, coeffs, ar_shift)
-                    if autobalance
-                    else 1.0
-                )
+                if ch == "Y":
+                    ys = fgs_parser.get_sY_values(ev)
+                elif ch == "Cb":
+                    ys = fgs_parser.get_sCb_values(ev)
+                else:
+                    ys = fgs_parser.get_sCr_values(ev)
 
-                errors = validate_fgs_pipeline(coeffs, ar_shift, ys, export_scale)
+                errors = fgs_math.validate_fgs_pipeline(coeffs, ar_shift, ys)
                 if errors:
                     if not ev_has_errors:
                         all_errors.append(f"Event {idx + 1}:")
@@ -243,6 +239,14 @@ class DynamicTimelineUI(QWidget):
         if dirty:
             title += " *"
         self.setWindowTitle(title)
+
+    def _on_fps_changed(self, text: str):
+        self._update_ui_state()
+        if self.time_format_combo.currentText() == "Frames":
+            self.build_timeline()
+
+    def _on_time_format_changed(self, text: str):
+        self.build_timeline()
 
     def closeEvent(self, event):
         if self.is_dirty():
@@ -349,13 +353,12 @@ class DynamicTimelineUI(QWidget):
         n = len(self.events)
         colors_cycle = self._COLORS
 
-        # Pre-compute per-event values using numpy for speed
         t_starts = np.empty(n)
         t_ends = np.empty(n)
         strengths = np.empty(n)
         for i, ev in enumerate(self.events):
-            t_starts[i] = ev["start_time"] * 1e-7
-            t_ends[i] = ev["end_time"] * 1e-7
+            t_starts[i] = ticks_to_seconds(ev["start_time"])
+            t_ends[i] = ticks_to_seconds(ev["end_time"])
             strengths[i] = fgs_parser.avg_sy_strength(ev)
 
         self._ev_t_start = t_starts.tolist()
@@ -407,7 +410,30 @@ class DynamicTimelineUI(QWidget):
         self._label_artists = []
 
         self.ax.set_title("Timeline Overview (Click segment to edit)", color="white")
-        self.ax.set_xlabel("Time (seconds)", color="#cccccc")
+
+        time_format = self.time_format_combo.currentText()
+        fps = fps_from_label(self.fps_combo.currentText())
+
+        if time_format == "Frames":
+            self.ax.set_xlabel("Time (frames)", color="#cccccc")
+
+            def frame_formatter(x, pos):
+                frames = int(round(x * fps))
+                return str(frames)
+
+            self.ax.xaxis.set_major_formatter(FuncFormatter(frame_formatter))
+        elif time_format == "Timestamp":
+            self.ax.set_xlabel("Time (HH:MM:SS:mmm)", color="#cccccc")
+
+            def timecode_formatter(x, pos):
+                ticks = seconds_to_ticks(x)
+                return ticks_to_timecode(ticks)
+
+            self.ax.xaxis.set_major_formatter(FuncFormatter(timecode_formatter))
+        else:  # Seconds
+            self.ax.set_xlabel("Time (seconds)", color="#cccccc")
+            self.ax.xaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{x:.2f}"))
+
         self.ax.set_ylabel("Avg sY Strength", color="#cccccc")
         self.ax.tick_params(colors="white")
 
@@ -467,8 +493,6 @@ class DynamicTimelineUI(QWidget):
             self._label_artists.append(txt)
 
     def on_pick(self, event):
-        """Handle pick events on the LineCollection or Scatter dots."""
-        # Only open menu on Left Click AND when not currently panning
         if event.mouseevent is None or event.mouseevent.button != 1 or self._pan_active:
             return
         if event.artist not in (self._line_collection, self._scatter_collection):
@@ -499,13 +523,13 @@ class DynamicTimelineUI(QWidget):
         fps = self._current_fps()
         old_start_ticks = ev["start_time"]
         old_end_ticks = ev["end_time"]
-        old_start_s = old_start_ticks / 10_000_000
-        old_end_s = old_end_ticks / 10_000_000
+        old_start_s = ticks_to_seconds(old_start_ticks)
+        old_end_s = ticks_to_seconds(old_end_ticks)
         old_start_frames = ticks_to_frames(old_start_ticks, fps)
         old_end_frames = ticks_to_frames(old_end_ticks, fps)
 
         if idx > 0:
-            min_start_s = self.events[idx - 1]["end_time"] / 10_000_000
+            min_start_s = ticks_to_seconds(self.events[idx - 1]["end_time"])
             min_start_frames = (
                 ticks_to_frames(self.events[idx - 1]["end_time"], fps) + 1
             )
@@ -586,25 +610,23 @@ class DynamicTimelineUI(QWidget):
         page_tc = QWidget()
         ptc_layout = QVBoxLayout(page_tc)
         ptc_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         start_tc_input = QLineEdit()
         start_tc_input.setInputMask("99:99:99:999;_")
         start_tc_input.setText(ticks_to_timecode(old_start_ticks))
         ptc_layout.addLayout(_row("Start (TC):", start_tc_input))
-        
+
         end_tc_input = QLineEdit()
         end_tc_input.setInputMask("99:99:99:999;_")
         end_tc_input.setText(ticks_to_timecode(old_end_ticks))
         ptc_layout.addLayout(_row("End (TC):  ", end_tc_input))
-        
+
         stack.addWidget(page_tc)
 
         layout.addWidget(stack)
         hint = QLabel()
         hint.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(hint)
-
-        from .time_utils import ticks_to_seconds, seconds_to_ticks
 
         def _get_ticks():
             if rb_frames.isChecked():
@@ -679,22 +701,29 @@ class DynamicTimelineUI(QWidget):
 
         from .fgs_save import save_dynamic_fgs
 
+        default_name = "modified_fgs.txt"
+        if self.main_ui._video_path:
+            video_base = os.path.splitext(os.path.basename(self.main_ui._video_path))[0]
+            default_name = f"{video_base}.txt"
+
         saved = save_dynamic_fgs(
             self,
             original_filepath=self.filepath,
             header_lines=self.header_lines,
             events=self.events,
-            autobalance=self.autobalance_chk.isChecked(),
+            default_name=default_name,
         )
         if saved:
             self.original_events = copy.deepcopy(self.events)
-            self.original_autobalance = self.autobalance_chk.isChecked()
             self.original_fps_text = self.fps_combo.currentText()
             self._update_ui_state()
 
     def save_plot_as_png(self):
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Plot", os.path.join(get_base_dir(), "timeline.png"), "PNG (*.png)"
+            self,
+            "Save Plot",
+            os.path.join(get_base_dir(), "timeline.png"),
+            "PNG (*.png)",
         )
         if save_path:
             self.figure.savefig(save_path, dpi=300, bbox_inches="tight")

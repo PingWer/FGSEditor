@@ -11,6 +11,7 @@ COMMON_FPS: list[tuple[str, float]] = [
 
 DEFAULT_FPS_LABEL = "23.976"
 TICKS_PER_SECOND = 10_000_000  # 10^7 ticks = 1 second
+MAX_QT_INT = 2_147_483_647  # Max for 32-bit signed int
 
 
 def fps_from_label(label: str) -> float:
@@ -60,3 +61,17 @@ def timecode_to_ticks(tc: str) -> int:
         return total_ms * 10_000
     except ValueError:
         return 0
+
+
+def find_closest_fps_label(target_fps: float) -> str | None:
+    best_label = None
+    best_diff = float("inf")
+    for label, value in COMMON_FPS:
+        diff = abs(value - target_fps)
+        if diff < best_diff:
+            best_diff = diff
+            best_label = label
+    # Only accept if within 0.5%
+    if best_label and target_fps > 0 and best_diff / target_fps < 0.005:
+        return best_label
+    return None

@@ -1,101 +1,29 @@
 from __future__ import annotations
 import os
 from .app_paths import get_base_dir
+from . import fgs_parser
+from .fgs_parser import load_grain_preset
+
+_TABLE_DIR = os.path.normpath(os.path.join(get_base_dir(), "FGS_grain_size"))
 
 
-_TABLE_DIR = os.path.normpath(os.path.join(get_base_dir(), "FGS_size_table"))
-
-
-def _parse_coeffs(line: str) -> list[int]:
-    tokens = line.strip().split()
-    if not tokens:
-        return []
-    start = 0
-    if tokens[0] in ("cY", "cCb", "cCr"):
-        start = 1
-    result = []
-    for t in tokens[start:]:
-        t = t.rstrip(".,;")
-        try:
-            result.append(int(t))
-        except ValueError:
-            pass
-    return result
-
-
-def _parse_p_tokens(line: str) -> list[str]:
-    tokens = line.strip().split()
-    if tokens and tokens[0] == "p":
-        return tokens[1:]
-    return tokens
-
-
-def load_size_preset(size_index: int) -> dict | None:
-    """
-    Load a grain-size preset from FGS_size_table/<size_index>.txt.
-    Returns a dict with keys:
-        'p_tokens'  : list[str]   – raw p-row tokens
-        'cY'        : list[int]
-        'cCb'       : list[int]
-        'cCr'       : list[int]
-    Returns None if the file does not exist.
-    """
-    if not os.path.isdir(_TABLE_DIR):
-        return None
-    path = os.path.join(_TABLE_DIR, f"{size_index}.txt")
-    if not os.path.isfile(path):
-        return None
-
-    preset: dict = {"p_tokens": [], "cY": [], "cCb": [], "cCr": []}
-
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            tokens = line.split()
-            if not tokens:
-                continue
-            prefix = tokens[0]
-            if prefix == "p":
-                preset["p_tokens"] = tokens[1:]
-            elif prefix == "cY":
-                preset["cY"] = _parse_coeffs(line)
-            elif prefix == "cCb":
-                preset["cCb"] = _parse_coeffs(line)
-            elif prefix == "cCr":
-                preset["cCr"] = _parse_coeffs(line)
-
-    return preset
-
-
-def available_sizes() -> list[int]:
-    if not os.path.isdir(_TABLE_DIR):
-        return []
-    sizes = []
-    for fname in os.listdir(_TABLE_DIR):
-        base, ext = os.path.splitext(fname)
-        if ext == ".txt":
-            try:
-                sizes.append(int(base))
-            except ValueError:
-                pass
-    return sorted(sizes)
-
-
-def apply_size_preset_to_event(event: dict, size_index: int) -> bool:
+def apply_grain_preset_to_event(event: dict, name: str | None) -> bool:
     if "original_raw_lines" not in event:
         event["original_raw_lines"] = list(event.get("raw_lines", []))
     if "original_p_params" not in event:
-        p_val = event.get("p_params")
-        if p_val:
-            event["original_p_params"] = dict(p_val)
+        p_val = fgs_parser.get_p_params(event)
+        event["original_p_params"] = dict(p_val)
 
-    if size_index == -1:
+    if name is None or name == "-1":
         event["raw_lines"] = list(event.get("original_raw_lines", []))
         if "original_p_params" in event:
             event["p_params"] = dict(event["original_p_params"])
+        from .fgs_parser import _parse_scale_from_lines
+
+        event["scale_data"] = _parse_scale_from_lines(event.get("raw_lines", []))
         return True
 
-    preset = load_size_preset(size_index)
+    preset = load_grain_preset(name)
     if preset is None:
         return False
 
@@ -103,9 +31,7 @@ def apply_size_preset_to_event(event: dict, size_index: int) -> bool:
 
     preset_p = None
     if preset["p_tokens"]:
-        from .fgs_math import parse_p_row
-
-        preset_p = parse_p_row(preset["p_tokens"])
+        preset_p = fgs_parser.parse_p_row(preset["p_tokens"])
 
     for raw_line in event.get("raw_lines", []):
         tokens = raw_line.strip().split()
@@ -114,14 +40,10 @@ def apply_size_preset_to_event(event: dict, size_index: int) -> bool:
             continue
         prefix = tokens[0]
         if prefix == "p" and preset_p:
-            # We want to keep user's manual params (scaling_shift etc)
-            # but update AR lag and shift from the preset.
-            from .fgs_math import p_params_to_tokens
-
-            current_p = dict(event.get("p_params", event.get("original_p_params", {})))
+            current_p = dict(fgs_parser.get_p_params(event))
             current_p["ar_coeff_lag"] = preset_p["ar_coeff_lag"]
             current_p["ar_coeff_shift"] = preset_p["ar_coeff_shift"]
-            new_tokens = p_params_to_tokens(current_p)
+            new_tokens = fgs_parser.p_params_to_tokens(current_p)
             new_raw_lines.append("  p " + " ".join(new_tokens) + "\n")
         elif prefix == "cY":
             coeffs = preset.get("cY", [])
@@ -143,5 +65,9 @@ def apply_size_preset_to_event(event: dict, size_index: int) -> bool:
         else:
             event["p_params"]["ar_coeff_lag"] = preset_p["ar_coeff_lag"]
             event["p_params"]["ar_coeff_shift"] = preset_p["ar_coeff_shift"]
+
+    from .fgs_parser import _parse_scale_from_lines
+
+    event["scale_data"] = _parse_scale_from_lines(new_raw_lines)
 
     return True
