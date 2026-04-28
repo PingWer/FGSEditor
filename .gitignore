@@ -1,5 +1,4 @@
 *.exe
-!grav1synth.exe
 /build
 /dist
 /.venv

@@ -62,9 +62,7 @@ jobs:
           mkdir release
           Move-Item -Path dist/fgsview_loader.dist -Destination release/FGSEditor
           Copy-Item -Path FGS_grain_size  -Destination release/FGSEditor/FGS_grain_size  -Recurse
-          Copy-Item -Path FGS_size_table  -Destination release/FGSEditor/FGS_size_table  -Recurse
           Copy-Item -Path Templates       -Destination release/FGSEditor/Templates        -Recurse
-          Copy-Item -Path grav1synth.exe  -Destination release/FGSEditor/grav1synth.exe
           Copy-Item -Path NOTICE.md       -Destination release/FGSEditor/NOTICE.md
 
       - name: Upload artifact
@@ -114,7 +112,6 @@ jobs:
           mkdir -p release/FGSEditor
           cp dist/FGSEditor release/FGSEditor/
           cp -r FGS_grain_size  release/FGSEditor/FGS_grain_size
-          cp -r FGS_size_table  release/FGSEditor/FGS_size_table
           cp -r Templates       release/FGSEditor/Templates
           cp    NOTICE.md       release/FGSEditor/NOTICE.md
           chmod +x release/FGSEditor/FGSEditor
