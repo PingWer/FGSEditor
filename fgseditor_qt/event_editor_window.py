@@ -212,7 +212,9 @@ class EventEditorUI(QDialog):
             )
 
     def on_channel_change(self, text):
-        self.plotter.set_active_channel(text)
+        self.plotter.active_channel = text
+        self._update_plot_x_label()
+        self.plotter.refresh()
 
     def on_plotter_changed(self):
         self.current_scale_data = copy.deepcopy(self.plotter.current_data)
@@ -461,7 +463,32 @@ class EventEditorUI(QDialog):
         scaling_shift = fgs_parser.get_scaling_shift({"p_params": p_params})
         if self.plotter:
             self.plotter.set_clip_extremes(extremes, scaling_shift)
+            self._update_plot_x_label(p_params)
             self.plotter.refresh()
+
+    def _update_plot_x_label(self, p_params=None):
+        if not self.plotter:
+            return
+        if p_params is None:
+            p_params = self.sidebar.get_p_params()
+        
+        channel = self.plotter.active_channel
+        if channel == "sY":
+            label = "Y Value"
+        else:
+            if p_params.get("chroma_scaling_from_luma", 0) == 1:
+                label = "Derived from luma value"
+            else:
+                is_cb = (channel == "sCb")
+                mult = p_params.get("cb_mult" if is_cb else "cr_mult", 128)
+                luma_mult = p_params.get("cb_luma_mult" if is_cb else "cr_luma_mult", 128)
+                offset = p_params.get("cb_offset" if is_cb else "cr_offset", 256)
+                if mult == 128 and luma_mult == 192 and offset == 256:
+                    label = "Based on luma value"
+                else:
+                    label = f"{'Cb' if is_cb else 'Cr'} value"
+        
+        self.plotter.set_x_label(label)
 
     def closeEvent(self, event):
         if self.is_dirty():
@@ -513,9 +540,9 @@ class EventEditorUI(QDialog):
         self.dynamic_timeline_ui._push_undo()
         self.dynamic_timeline_ui.build_timeline()
 
-        from .fgs_parser import avg_sy_strength
-
-        new_strength = avg_sy_strength(self.event_dict)
+        from .dynamic_ui import _process_timeline_event
+        
+        _, _, new_strength = _process_timeline_event((0, "", self.event_dict))
 
         self.original_scale_data = copy.deepcopy(self.current_scale_data)
         self.original_p_params = self.sidebar.get_p_params()
@@ -526,7 +553,7 @@ class EventEditorUI(QDialog):
         QMessageBox.information(
             self,
             "Event Updated",
-            f"Event {self.event_idx + 1} updated.\nNew avg sY strength: {new_strength:.2f}",
+            f"Event {self.event_idx + 1} updated.\nNew effective amplitude: {new_strength:.2f}",
         )
 
         self.dynamic_timeline_ui.build_timeline()

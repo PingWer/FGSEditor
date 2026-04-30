@@ -161,6 +161,9 @@ def setup_dark_theme(app: QApplication):
 
 
 def main():
+    import multiprocessing
+    multiprocessing.freeze_support()
+    
     if os.name == "nt":
         import ctypes
 

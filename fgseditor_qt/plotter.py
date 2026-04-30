@@ -156,6 +156,9 @@ class InteractiveFGSPlotter(QWidget):
         self.active_channel = channel_name
         self.refresh()
 
+    def set_x_label(self, label: str):
+        self._x_label_text = label
+
     def set_data(self, data_dict):
         self.current_data = copy.deepcopy(data_dict)
 
@@ -229,7 +232,8 @@ class InteractiveFGSPlotter(QWidget):
         self.annot.set_visible(False)
 
         self.ax.set_title("Film Grain Strength Interactive Plot", color="white")
-        self.ax.set_xlabel("Y Value", color="#cccccc")
+        xlabel = getattr(self, "_x_label_text", "Y Value")
+        self.ax.set_xlabel(xlabel, color="#cccccc")
         self.ax.set_ylabel("Strength", color="#cccccc")
 
         self.ax.tick_params(colors="white")

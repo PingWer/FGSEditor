@@ -19,7 +19,6 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.collections import LineCollection
 from matplotlib.ticker import FuncFormatter
-import numpy as np
 from . import fgs_parser
 from . import fgs_math
 from .app_paths import get_base_dir
@@ -35,10 +34,93 @@ from .time_utils import (
     ticks_to_seconds,
     seconds_to_ticks,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
+from functools import lru_cache
 
 # Maximum number of event labels rendered (to avoid clutter + slowness)
 _MAX_LABELS = 50
+
+
+@lru_cache(maxsize=128)
+def _cached_compute_grain_extremes(
+    seed, ar_lag, ar_shift, grain_scale_shift, cy_coeffs_tuple
+):
+    from .fgs_grain_sim import compute_grain_extremes
+
+    return compute_grain_extremes(
+        seed=seed,
+        cy_coeffs=list(cy_coeffs_tuple),
+        cb_coeffs=[],
+        cr_coeffs=[],
+        ar_lag=ar_lag,
+        ar_shift=ar_shift,
+        grain_scale_shift=grain_scale_shift,
+    )
+
+
+def _get_event_hash(ev: dict) -> str:
+    import json
+
+    ev_copy = {k: v for k, v in ev.items() if k not in ("start_time", "end_time")}
+    return json.dumps(ev_copy, sort_keys=True)
+
+
+def _process_timeline_event(args):
+    i, key, ev = args
+    from . import fgs_parser
+    from .fgs_grain_sim import compute_amplitude_at_point
+    from .dynamic_ui import _cached_compute_grain_extremes
+
+    evt_ctx = {"p_params": ev.get("p_params", fgs_parser.P_DEFAULTS)}
+    ar_shift = fgs_parser.get_ar_coeff_shift(evt_ctx)
+    ar_lag = fgs_parser.get_ar_coeff_lag(evt_ctx)
+    scaling_shift = fgs_parser.get_scaling_shift(evt_ctx)
+    gs_shift = fgs_parser.get_grain_scale_shift(evt_ctx)
+    seed = fgs_parser.get_grain_seed(ev)
+
+    cy_coeffs, _, _ = fgs_parser.extract_ar_coeffs_from_raw_lines(
+        ev.get("raw_lines", [])
+    )
+
+    try:
+        extremes = _cached_compute_grain_extremes(
+            seed, ar_lag, ar_shift, gs_shift, tuple(cy_coeffs)
+        )
+        lmax = extremes["luma_max"]
+    except Exception:
+        lmax = 0
+
+    scale_data = fgs_parser.get_scale_data(ev)
+    sy_data = scale_data.get("sY", {})
+    if not sy_data or not sy_data.get("y"):
+        strength = 0.0
+    else:
+        sY_avg = sum(sy_data["y"]) / len(sy_data["y"])
+        strength = compute_amplitude_at_point(lmax, sY_avg, scaling_shift)
+
+    return i, key, strength
+
+
+class TimelineDataWorker(QThread):
+    finished_data = Signal(object)
+
+    def __init__(self, missing_events):
+        super().__init__()
+        import copy
+
+        self.missing_events = copy.deepcopy(missing_events)
+
+    def run(self):
+        import concurrent.futures
+
+        if not self.missing_events:
+            self.finished_data.emit([])
+            return
+
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            results = list(executor.map(_process_timeline_event, self.missing_events))
+
+        self.finished_data.emit(results)
 
 
 class DynamicTimelineUI(QWidget):
@@ -350,27 +432,67 @@ class DynamicTimelineUI(QWidget):
             self.canvas.draw_idle()
             return
 
+        if not hasattr(self, "_strength_cache"):
+            self._strength_cache = {}
+
+        missing_events = []
+        for i, ev in enumerate(self.events):
+            key = _get_event_hash(ev)
+            if key not in self._strength_cache:
+                missing_events.append((i, key, ev))
+
+        if missing_events:
+            self.ax.set_title("Timeline Overview (Calculating...)", color="#f59e0b")
+            self.canvas.draw()
+            from PySide6.QtWidgets import QApplication
+
+            QApplication.processEvents()
+
+            if hasattr(self, "_timeline_worker") and self._timeline_worker.isRunning():
+                try:
+                    self._timeline_worker.finished_data.disconnect()
+                except Exception:
+                    pass
+
+            self._timeline_worker = TimelineDataWorker(missing_events)
+            self._timeline_worker.finished_data.connect(self._on_timeline_data_ready)
+            self._timeline_worker.start()
+        else:
+            self._on_timeline_data_ready([])
+
+    def _on_timeline_data_ready(self, new_results):
+        if not hasattr(self, "_strength_cache"):
+            self._strength_cache = {}
+
+        for idx, key, strength in new_results:
+            self._strength_cache[key] = strength
+
         n = len(self.events)
-        colors_cycle = self._COLORS
+        import numpy as np
 
         t_starts = np.empty(n)
         t_ends = np.empty(n)
         strengths = np.empty(n)
+
+        from .time_utils import ticks_to_seconds
+
         for i, ev in enumerate(self.events):
             t_starts[i] = ticks_to_seconds(ev["start_time"])
             t_ends[i] = ticks_to_seconds(ev["end_time"])
-            strengths[i] = fgs_parser.avg_sy_strength(ev)
+            key = _get_event_hash(ev)
+            strengths[i] = self._strength_cache.get(key, 0.0)
 
+        colors_cycle = self._COLORS
         self._ev_t_start = t_starts.tolist()
         self._ev_t_end = t_ends.tolist()
         self._ev_strength = strengths.tolist()
         self._ev_mid_x = ((t_starts + t_ends) / 2.0).tolist()
         self._label_artists: list = []
 
-        min_s = float(strengths.min())
-        max_s = float(strengths.max())
-        min_t = float(t_starts.min())
-        max_t = float(t_ends.max())
+        min_s = float(strengths.min()) if n > 0 else 0.0
+        max_s = float(strengths.max()) if n > 0 else 0.0
+        min_t = float(t_starts.min()) if n > 0 else 0.0
+        max_t = float(t_ends.max()) if n > 0 else 0.0
         margin_y = max(5, (max_s - min_s) * 0.3)
         margin_x = max(1, (max_t - min_t) * 0.05)
         self._margin_y = margin_y
@@ -434,7 +556,7 @@ class DynamicTimelineUI(QWidget):
             self.ax.set_xlabel("Time (seconds)", color="#cccccc")
             self.ax.xaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{x:.2f}"))
 
-        self.ax.set_ylabel("Avg sY Strength", color="#cccccc")
+        self.ax.set_ylabel("Effective Amplitude (px \u00b1)", color="#cccccc")
         self.ax.tick_params(colors="white")
 
         self._xlim_full = (min_t - margin_x, max_t + margin_x)

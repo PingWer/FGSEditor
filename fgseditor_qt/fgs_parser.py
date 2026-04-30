@@ -267,13 +267,6 @@ def is_dynamic(events):
     return len(events) > 1
 
 
-def avg_sy_strength(event):
-    ys = event["scale_data"]["sY"]["y"]
-    if not ys:
-        return 0
-    return sum(ys) / len(ys)
-
-
 def available_grain_presets() -> list[str]:
     import os
     from .app_paths import get_base_dir

@@ -32,7 +32,7 @@ def show_notice(parent=None):
     from .app_paths import get_base_dir
 
     dialog = QDialog(parent)
-    dialog.setWindowTitle("Licenses & Copyright")
+    dialog.setWindowTitle("Licenses && Copyright")
     dialog.setMinimumSize(800, 600)
 
     layout = QVBoxLayout(dialog)
@@ -126,7 +126,7 @@ def create_standard_menu(
     info_menu = QMenu("Info", menu_bar)
     info_menu.addAction("Credits").triggered.connect(show_credits_cb)
     info_menu.addAction("GitHub").triggered.connect(open_github_cb)
-    info_menu.addAction("Licenses & Copyright").triggered.connect(show_notice_cb)
+    info_menu.addAction("Licenses && Copyright").triggered.connect(show_notice_cb)
     menu_bar.addMenu(info_menu)
 
     return menu_bar

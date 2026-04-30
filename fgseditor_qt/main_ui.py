@@ -296,7 +296,9 @@ class MainUI(QMainWindow):
         h_splitter.setSizes([320, 680])
 
     def on_channel_change(self, text):
-        self.plotter.set_active_channel(text)
+        self.plotter.active_channel = text
+        self._update_plot_x_label()
+        self.plotter.refresh()
 
     def on_plotter_changed(self):
         self.current_data = self.plotter.current_data
@@ -499,9 +501,32 @@ class MainUI(QMainWindow):
         extremes = getattr(self.grain_preview, "_last_extremes", None)
         scaling_shift = fgs_parser.get_scaling_shift({"p_params": p_params})
         self.plotter.set_clip_extremes(extremes, scaling_shift)
+        self._update_plot_x_label(p_params)
         self.plotter.refresh()
 
         self._update_ui_state()
+
+    def _update_plot_x_label(self, p_params=None):
+        if p_params is None:
+            p_params = self.sidebar.get_p_params()
+        
+        channel = self.plotter.active_channel
+        if channel == "sY":
+            label = "Y Value"
+        else:
+            if p_params.get("chroma_scaling_from_luma", 0) == 1:
+                label = "Derived from luma value"
+            else:
+                is_cb = (channel == "sCb")
+                mult = p_params.get("cb_mult" if is_cb else "cr_mult", 128)
+                luma_mult = p_params.get("cb_luma_mult" if is_cb else "cr_luma_mult", 128)
+                offset = p_params.get("cb_offset" if is_cb else "cr_offset", 256)
+                if mult == 128 and luma_mult == 192 and offset == 256:
+                    label = "Based on luma value"
+                else:
+                    label = f"{'Cb' if is_cb else 'Cr'} value"
+        
+        self.plotter.set_x_label(label)
 
     def is_dirty(self) -> bool:
         if not self.filepath:

@@ -325,7 +325,7 @@ class PhotonNoiseGenerator:
         lines = [
             "filmgrn1",
             "E 0 18446744073709551615 1 787 1",
-            "\tp 0 6 0 0 0 0 0 0 0",
+            "\tp 0 6 0 8 0 1 128 128 256 128 128 256",
             f"\tsY 14 {sY_str}",
             "\tsCb 0",
             "\tsCr 0",

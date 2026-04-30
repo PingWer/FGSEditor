@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 from .utils import section_label, create_row, create_spin
 from .. import fgs_parser
 from ..fgs_parser import P_DEFAULTS
-from ..AFGS_TABLE_and_SEEDS import NETFLIX_SEEDS
+from ..AFGS_TABLE_and_SEEDS import CHERRY_SEEDS
 
 
 class PanelFGSValue(QWidget):
@@ -53,7 +53,7 @@ class PanelFGSValue(QWidget):
 
         self._seed_rand_btn = QPushButton("Rnd")
         self._seed_rand_btn.setFixedWidth(38)
-        self._seed_rand_btn.setToolTip("Pick a random seed from the Netflix seed pool")
+        self._seed_rand_btn.setToolTip("Pick a random seed from the seed pool")
         self._seed_rand_btn.setStyleSheet(
             "QPushButton { background: #3a3a5c; color: #aaccff; border: 1px solid #555577; "
             "border-radius: 3px; font-size: 10px; font-weight: bold; padding: 2px; }"
@@ -68,7 +68,7 @@ class PanelFGSValue(QWidget):
         self._seed_spin.valueChanged.connect(self._on_seed_changed)
 
     def _on_random_seed(self):
-        seeds_list = list(NETFLIX_SEEDS)
+        seeds_list = list(CHERRY_SEEDS)
         new_seed = random.choice(seeds_list)
         while new_seed == 0:
             new_seed = random.choice(seeds_list)
