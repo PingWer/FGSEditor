@@ -422,8 +422,11 @@ class InteractiveFGSPlotter(QWidget):
             else:
                 from PySide6.QtWidgets import QMessageBox
 
-                if len(self.current_data[ch]["x"]) >= 14:
-                    QMessageBox.warning(self, "Limit", "You cannot exceed 14 points.")
+                limit = 14 if ch == "sY" else 10
+                if len(self.current_data[ch]["x"]) >= limit:
+                    QMessageBox.warning(
+                        self, "Limit", f"You cannot exceed {limit} points for this channel."
+                    )
                 else:
                     new_x = max(16, min(235, x_val))
                     new_y = max(0, min(255, y_val))

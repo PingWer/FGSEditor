@@ -168,7 +168,7 @@ def main():
         import ctypes
 
         try:
-            myappid = "PingWer.fgseditor.3.1.1"
+            myappid = "PingWer.fgseditor.3.1.2"
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except Exception:
             pass

@@ -560,12 +560,23 @@ class MainUI(QMainWindow):
         pure_ar_count = 2 * ar_lag * (ar_lag + 1)
 
         all_errors = []
+        chroma_from_luma = p_params.get("chroma_scaling_from_luma", 0) == 1
         for ch, coeffs, ch_key in [
             ("Y", cy_coeffs, "sY"),
             ("Cb", cb_coeffs, "sCb"),
             ("Cr", cr_coeffs, "sCr"),
         ]:
-            ys = self.current_data.get(ch_key, {}).get("y", [])
+            if chroma_from_luma and ch in ("Cb", "Cr"):
+                continue
+            data = self.current_data.get(ch_key, {})
+            xs = data.get("x", [])
+            ys = data.get("y", [])
+            
+            # Point count check
+            max_pts = 14 if ch == "Y" else 10
+            if len(xs) > max_pts:
+                all_errors.append(f"Channel {ch}: Too many scaling points ({len(xs)} > {max_pts}).")
+
             ar_coeffs = coeffs[:pure_ar_count] if ch in ("Cb", "Cr") else coeffs
             errors = fgs_math.validate_fgs_pipeline(ar_coeffs, ar_shift, ys)
             if errors:

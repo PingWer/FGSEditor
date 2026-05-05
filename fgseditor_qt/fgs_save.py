@@ -10,11 +10,21 @@ def _expected_coeff_count(ar_coeff_lag: int) -> int:
 
 
 def _build_scale_line(prefix: str, data: dict) -> str:
-    pts = len(data.get("x", []))
+    # AV1 spec limits: 14 points for Luma (sY), 10 points for Chroma (sCb, sCr)
+    max_pts = 14 if prefix == "sY" else 10
+    
+    x_list = data.get("x", [])
+    y_list = data.get("y", [])
+    
+    if len(x_list) > max_pts:
+        x_list = x_list[:max_pts]
+        y_list = y_list[:max_pts]
+    
+    pts = len(x_list)
     if pts == 0:
         return f"  {prefix} 0\n"
     pairs = []
-    for x, y in zip(data["x"], data["y"]):
+    for x, y in zip(x_list, y_list):
         pairs.extend([str(x), str(y)])
     return f"  {prefix} {pts} " + " ".join(pairs) + "\n"
 
@@ -116,10 +126,12 @@ def build_static_lines(
         result.append(f"E {start_time} {end_time} 1 {seed_val} 1\n")
     result.append(_build_p_line(p_params))
 
+    chroma_from_luma = p_params.get("chroma_scaling_from_luma", 0) == 1
     for ch_prefix in ("sY", "sCb", "sCr"):
-        result.append(
-            _build_scale_line(ch_prefix, scale_data.get(ch_prefix, {"x": [], "y": []}))
-        )
+        data = scale_data.get(ch_prefix, {"x": [], "y": []})
+        if chroma_from_luma and ch_prefix in ("sCb", "sCr"):
+            data = {"x": [], "y": []}
+        result.append(_build_scale_line(ch_prefix, data))
 
     result.append(_build_c_line("cY", cy_coeffs, lag))
     result.append(_build_c_line("cCb", cb_coeffs, lag))
@@ -159,12 +171,12 @@ def build_dynamic_lines(
 
         lines.append(_build_p_line(p_params))
 
+        chroma_from_luma = p_params.get("chroma_scaling_from_luma", 0) == 1
         for ch_prefix in ("sY", "sCb", "sCr"):
-            lines.append(
-                _build_scale_line(
-                    ch_prefix, scale_data.get(ch_prefix, {"x": [], "y": []})
-                )
-            )
+            data = scale_data.get(ch_prefix, {"x": [], "y": []})
+            if chroma_from_luma and ch_prefix in ("sCb", "sCr"):
+                data = {"x": [], "y": []}
+            lines.append(_build_scale_line(ch_prefix, data))
 
         lines.append(_build_c_line("cY", cy_coeffs, lag))
         lines.append(_build_c_line("cCb", cb_coeffs, lag))
