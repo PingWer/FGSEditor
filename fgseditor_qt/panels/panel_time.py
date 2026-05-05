@@ -172,7 +172,7 @@ class PanelTime(QWidget):
                     self._suppress = False
 
             # Default to all video duration
-            self._all_duration_chk.setChecked(True)
+            self._all_duration_chk.setChecked(False)
 
         if not has_video:
             self._all_duration_chk.setChecked(False)

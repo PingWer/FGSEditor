@@ -834,6 +834,7 @@ class DynamicTimelineUI(QWidget):
             header_lines=self.header_lines,
             events=self.events,
             default_name=default_name,
+            force_path=self.filepath,
         )
         if saved:
             self.original_events = copy.deepcopy(self.events)

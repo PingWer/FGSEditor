@@ -225,6 +225,7 @@ class ParamsSidebar(QWidget):
 
     def set_video_info(self, info: dict | None) -> None:
         self.panel_time.set_video_info(info)
+        self.panel_photon.set_video_info(info)
 
     def get_event_time_bounds(self) -> tuple[int, int]:
         return self.panel_time.get_times()

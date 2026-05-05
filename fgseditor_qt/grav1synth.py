@@ -29,9 +29,12 @@ def get_grav1synth_path() -> str | None:
 
 def _run(args: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
     kwargs = dict(
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Merge stderr into stdout
         text=True,
         timeout=timeout,
+        encoding="utf-8",
+        errors="replace", # Handle potential encoding issues
     )
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -85,8 +88,9 @@ def inspect_fgs(video_path: str, output_txt: str) -> bool:
             return False
 
         raise RuntimeError(
-            f"grav1synth inspect failed (exit {result.returncode}):\n"
-            f"{result.stderr or result.stdout or '(no output)'}"
+            f"grav1synth inspect failed (exit {result.returncode}).\n"
+            f"Command: {' '.join(result.args)}\n\n"
+            f"Output:\n{result.stdout or '(no output)'}"
         )
 
     if not os.path.isfile(output_txt):
@@ -125,16 +129,19 @@ def apply_fgs(
         )
 
     result = _run(
-        [exe, "apply", "-g", grain_txt, "-o", output_path, "-y", video_path],
+        [exe, "apply", "-g", grain_txt, "-o", output_path, "-y", "--replace", video_path],
         timeout=600,
     )
 
     if result.returncode != 0:
-        msg = (result.stderr or result.stdout or "(no output)").strip()
-        return False, f"grav1synth apply failed (exit {result.returncode}):\n{msg}"
+        msg = (result.stdout or "(no output)").strip()
+        cmd_str = " ".join(result.args)
+        return False, f"grav1synth apply failed (exit {result.returncode}).\n\nCommand: {cmd_str}\n\nOutput:\n{msg}"
 
     if not os.path.isfile(output_path):
-        return False, "grav1synth finished but the output file was not created."
+        msg = (result.stdout or "(no output)").strip()
+        cmd_str = " ".join(result.args)
+        return False, f"grav1synth finished (exit 0) but the output file was not created.\n\nCommand: {cmd_str}\n\nOutput:\n{msg}"
 
     return True, f"Video saved to: {output_path}"
 

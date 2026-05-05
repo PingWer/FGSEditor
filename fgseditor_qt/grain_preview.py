@@ -231,6 +231,9 @@ class GrainPreviewPlotter(QWidget):
 
         validation_warnings = []
 
+        ar_lag = fgs_parser.get_ar_coeff_lag(evt_ctx)
+        pure_ar_count = 2 * ar_lag * (ar_lag + 1)
+
         for ch_name, coeffs in [
             ("Y", self._cy_coeffs),
             ("Cb", self._cb_coeffs),
@@ -244,7 +247,10 @@ class GrainPreviewPlotter(QWidget):
                     if ch_name == "Cb"
                     else scr_data.get("y", [])
                 )
-                warnings = validate_fgs_pipeline(coeffs, ar_shift, ch_vals)
+                ar_coeffs = (
+                    coeffs[:pure_ar_count] if ch_name in ("Cb", "Cr") else coeffs
+                )
+                warnings = validate_fgs_pipeline(ar_coeffs, ar_shift, ch_vals)
                 validation_warnings.extend(warnings)
 
         if validation_warnings:

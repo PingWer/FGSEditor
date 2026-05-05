@@ -138,3 +138,10 @@ class PanelPhotonNoise(QWidget):
         self._pn_tf.setEnabled(pn_state)
         self._pn_range.setEnabled(pn_state)
         self._pn_format.setEnabled(pn_state)
+
+    def set_video_info(self, info: dict | None) -> None:
+        if info:
+            w = str(info.get("width", "1920"))
+            h = str(info.get("height", "1080"))
+            self._pn_width.setText(w)
+            self._pn_height.setText(h)

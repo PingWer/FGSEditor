@@ -304,6 +304,7 @@ class MainUI(QMainWindow):
         self.current_data = self.plotter.current_data
         self._sync_chromas_if_needed()
         self._refresh_grain_preview()
+        self._update_ui_state()
         self._update_last_known_state()
 
     def _sync_chromas_if_needed(self):
@@ -329,6 +330,7 @@ class MainUI(QMainWindow):
         self._sync_chromas_if_needed()
 
         self._refresh_grain_preview(p_params=p_params)
+        self._update_ui_state()
         self._update_last_known_state()
 
     def _on_grain_size_changed(self, size: str):
@@ -509,7 +511,7 @@ class MainUI(QMainWindow):
     def _update_plot_x_label(self, p_params=None):
         if p_params is None:
             p_params = self.sidebar.get_p_params()
-        
+
         channel = self.plotter.active_channel
         if channel == "sY":
             label = "Y Value"
@@ -517,15 +519,17 @@ class MainUI(QMainWindow):
             if p_params.get("chroma_scaling_from_luma", 0) == 1:
                 label = "Derived from luma value"
             else:
-                is_cb = (channel == "sCb")
+                is_cb = channel == "sCb"
                 mult = p_params.get("cb_mult" if is_cb else "cr_mult", 128)
-                luma_mult = p_params.get("cb_luma_mult" if is_cb else "cr_luma_mult", 128)
+                luma_mult = p_params.get(
+                    "cb_luma_mult" if is_cb else "cr_luma_mult", 128
+                )
                 offset = p_params.get("cb_offset" if is_cb else "cr_offset", 256)
                 if mult == 128 and luma_mult == 192 and offset == 256:
                     label = "Based on luma value"
                 else:
                     label = f"{'Cb' if is_cb else 'Cr'} value"
-        
+
         self.plotter.set_x_label(label)
 
     def is_dirty(self) -> bool:
@@ -548,10 +552,12 @@ class MainUI(QMainWindow):
 
         p_params = self.sidebar.get_p_params()
         ar_shift = fgs_parser.get_ar_coeff_shift({"p_params": p_params})
+        ar_lag = fgs_parser.get_ar_coeff_lag({"p_params": p_params})
 
         cy_coeffs, cb_coeffs, cr_coeffs = fgs_parser.extract_ar_coeffs_from_raw_lines(
             self._current_event.get("raw_lines", [])
         )
+        pure_ar_count = 2 * ar_lag * (ar_lag + 1)
 
         all_errors = []
         for ch, coeffs, ch_key in [
@@ -560,8 +566,8 @@ class MainUI(QMainWindow):
             ("Cr", cr_coeffs, "sCr"),
         ]:
             ys = self.current_data.get(ch_key, {}).get("y", [])
-
-            errors = fgs_math.validate_fgs_pipeline(coeffs, ar_shift, ys)
+            ar_coeffs = coeffs[:pure_ar_count] if ch in ("Cb", "Cr") else coeffs
+            errors = fgs_math.validate_fgs_pipeline(ar_coeffs, ar_shift, ys)
             if errors:
                 all_errors.append(
                     f"Channel {ch}:\n" + "\n".join(" - " + e for e in errors)
@@ -693,7 +699,7 @@ class MainUI(QMainWindow):
                 self,
                 "FGS Found",
                 "This video contains an existing Film Grain Synthesis table.\n\n"
-                "Do you want to modify it, or create a new one from scratch?",
+                "If you want to edit it, press Yes. Otherwise, press No to create a new one.",
                 QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
             )
             if reply == QMessageBox.Cancel:
@@ -932,14 +938,17 @@ class MainUI(QMainWindow):
 
     def save_file(self):
         if not self.filepath:
-            return
-
-        start_t, end_t = None, None
-        # Sync times from the Time panel
-        if self._current_event is not None:
-            start_t, end_t = self.sidebar.get_event_time_bounds()
-            self._current_event["start_time"] = start_t
-            self._current_event["end_time"] = end_t
+            # If no filepath, we might need a default name or just let save_static_fgs ask
+            start_t, end_t = None, None
+            if self._current_event:
+                start_t, end_t = self.sidebar.get_event_time_bounds()
+        else:
+            start_t, end_t = None, None
+            # Sync times from the Time panel
+            if self._current_event is not None:
+                start_t, end_t = self.sidebar.get_event_time_bounds()
+                self._current_event["start_time"] = start_t
+                self._current_event["end_time"] = end_t
 
         errors = self._get_validation_errors()
         if errors:
@@ -965,6 +974,26 @@ class MainUI(QMainWindow):
             video_base = os.path.splitext(os.path.basename(self._video_path))[0]
             default_name = f"{video_base}.txt"
 
+        force_path = self.filepath
+        if self.filepath:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Save Options")
+            msg_box.setText(
+                f"File already exists:\n{os.path.basename(self.filepath)}\n\nDo you want to overwrite it or save as a new file?"
+            )
+
+            overwrite_btn = msg_box.addButton("Overwrite", QMessageBox.AcceptRole)
+            save_as_btn = msg_box.addButton("Save As...", QMessageBox.ActionRole)
+            cancel_btn = msg_box.addButton(QMessageBox.Cancel)
+
+            msg_box.setDefaultButton(overwrite_btn)
+            msg_box.exec()
+
+            if msg_box.clickedButton() == cancel_btn:
+                return
+            if msg_box.clickedButton() == save_as_btn:
+                force_path = None
+
         saved = save_static_fgs(
             self,
             original_filepath=self.filepath,
@@ -973,7 +1002,9 @@ class MainUI(QMainWindow):
             event_raw_lines=event_raw_lines,
             start_time=start_t,
             end_time=end_t,
+            grain_seed=self.sidebar.get_seed(),
             default_name=default_name,
+            force_path=force_path,
         )
 
         if saved:
@@ -1083,12 +1114,9 @@ class MainUI(QMainWindow):
                 original_lines = header_and_e + event_raw_lines
 
             if self._current_event is not None:
-                from .time_utils import seconds_to_ticks
-
                 start_t = self._current_event.get("start_time", 0)
                 end_t = self._current_event.get("end_time", 0)
-                if self._video_path:
-                    end_t += seconds_to_ticks(10.0)
+                pass
                 updated_lines = []
                 for line in original_lines:
                     tokens = line.strip().split()
@@ -1101,7 +1129,14 @@ class MainUI(QMainWindow):
                     updated_lines.append(line)
                 original_lines = updated_lines
 
-            new_lines = build_static_lines(original_lines, self.current_data, p_params)
+            new_lines = build_static_lines(
+                original_lines,
+                self.current_data,
+                p_params,
+                start_time=start_t,
+                end_time=end_t,
+                grain_seed=self.sidebar.get_seed(),
+            )
 
             with open(tmp_fgs, "w", encoding="utf-8") as fh:
                 fh.writelines(new_lines)

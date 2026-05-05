@@ -16,6 +16,9 @@ xcopy /s /e /i /q FGS_grain_size dist\FGS_grain_size
 if exist "dist\Templates" rmdir /s /q dist\Templates
 xcopy /s /e /i /q Templates dist\Templates
 
+echo Copying grav1synth.exe...
+if exist "grav1synth.exe" copy /y grav1synth.exe dist\grav1synth.exe
+
 echo Copying NOTICE.md...
 if exist "NOTICE.md" copy /y NOTICE.md dist\NOTICE.md
 

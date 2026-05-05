@@ -17,7 +17,7 @@ def show_credits(parent=None):
     msg = QMessageBox(parent)
     msg.setWindowTitle(" ")
     msg.setText(
-        "FGSEditor v3.0.0\n\n"
+        "FGSEditor v3.1.1\n\n"
         'Copyright \u00a9 2026 Michele "PingWer" Cosentino\n\n'
         'Collaborators:\nManuel "Mhanz3500" Moscardi'
     )

@@ -1,12 +1,3 @@
-"""
-Deterministic AV1 Film Grain Synthesis Engine.
-
-The primary output is the real min/max extremes of the grain template,
-which are then used to compute bit-exact delta values for the UI preview.
-
-Reference: AV1 spec section 7.18.3
-"""
-
 from __future__ import annotations
 
 from .AFGS_TABLE_and_SEEDS import GAUSSIAN_SEQUENCE

@@ -396,6 +396,8 @@ class EventEditorUI(QDialog):
     def _get_validation_errors(self) -> list[str]:
         p_params = self.sidebar.get_p_params()
         ar_shift = p_params.get("ar_coeff_shift", 8)
+        ar_lag = p_params.get("ar_coeff_lag", 3)
+        pure_ar_count = 2 * ar_lag * (ar_lag + 1)
 
         cy_coeffs, cb_coeffs, cr_coeffs = fgs_parser.extract_ar_coeffs_from_raw_lines(
             self._working.get("raw_lines", [])
@@ -408,8 +410,8 @@ class EventEditorUI(QDialog):
             ("Cr", cr_coeffs, "sCr"),
         ]:
             ys = self.current_scale_data.get(ch_key, {}).get("y", [])
-
-            errors = fgs_math.validate_fgs_pipeline(coeffs, ar_shift, ys)
+            ar_coeffs = coeffs[:pure_ar_count] if ch in ("Cb", "Cr") else coeffs
+            errors = fgs_math.validate_fgs_pipeline(ar_coeffs, ar_shift, ys)
             if errors:
                 all_errors.append(
                     f"Channel {ch}:\n" + "\n".join(" - " + e for e in errors)
@@ -471,7 +473,7 @@ class EventEditorUI(QDialog):
             return
         if p_params is None:
             p_params = self.sidebar.get_p_params()
-        
+
         channel = self.plotter.active_channel
         if channel == "sY":
             label = "Y Value"
@@ -479,15 +481,17 @@ class EventEditorUI(QDialog):
             if p_params.get("chroma_scaling_from_luma", 0) == 1:
                 label = "Derived from luma value"
             else:
-                is_cb = (channel == "sCb")
+                is_cb = channel == "sCb"
                 mult = p_params.get("cb_mult" if is_cb else "cr_mult", 128)
-                luma_mult = p_params.get("cb_luma_mult" if is_cb else "cr_luma_mult", 128)
+                luma_mult = p_params.get(
+                    "cb_luma_mult" if is_cb else "cr_luma_mult", 128
+                )
                 offset = p_params.get("cb_offset" if is_cb else "cr_offset", 256)
                 if mult == 128 and luma_mult == 192 and offset == 256:
                     label = "Based on luma value"
                 else:
                     label = f"{'Cb' if is_cb else 'Cr'} value"
-        
+
         self.plotter.set_x_label(label)
 
     def closeEvent(self, event):
@@ -541,7 +545,7 @@ class EventEditorUI(QDialog):
         self.dynamic_timeline_ui.build_timeline()
 
         from .dynamic_ui import _process_timeline_event
-        
+
         _, _, new_strength = _process_timeline_event((0, "", self.event_dict))
 
         self.original_scale_data = copy.deepcopy(self.current_scale_data)
