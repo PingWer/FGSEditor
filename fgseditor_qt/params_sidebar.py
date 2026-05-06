@@ -157,11 +157,9 @@ class ParamsSidebar(QWidget):
         if self._suppress:
             return
 
-        import re
+        from .fgs_math import _parse_grain_size
 
-        has_digit = bool(re.search(r"\d+", str(name)))
-
-        if name == "-1" or not has_digit:
+        if _parse_grain_size(name) == -1:
             pass
         else:
             preset = load_grain_preset(name)

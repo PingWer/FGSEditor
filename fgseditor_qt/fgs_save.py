@@ -192,7 +192,7 @@ def save_dynamic_fgs(
     events: list[dict],
     default_name: str = "modified_fgs.txt",
     force_path: str | None = None,
-) -> bool:
+) -> str | None:
     if force_path:
         save_path = force_path
     else:
@@ -206,18 +206,18 @@ def save_dynamic_fgs(
         )
 
     if not save_path:
-        return False
+        return None
 
     try:
         new_lines = build_dynamic_lines(header_lines, events)
         with open(save_path, "w", encoding="utf-8") as f:
             f.writelines(new_lines)
-        return True
+        return save_path
     except Exception as e:
         QMessageBox.critical(
             parent_widget, "Save Error", f"Could not save Dynamic FGS:\n{str(e)}"
         )
-        return False
+        return None
 
 
 def save_static_fgs(
@@ -231,7 +231,7 @@ def save_static_fgs(
     grain_seed: int | None = None,
     default_name: str = "modified_fgs.txt",
     force_path: str | None = None,
-) -> bool:
+) -> str | None:
     if force_path:
         save_path = force_path
     else:
@@ -245,7 +245,7 @@ def save_static_fgs(
         )
 
     if not save_path:
-        return False
+        return None
 
     try:
         # Load header and E from existing file if we are modifying
@@ -274,9 +274,9 @@ def save_static_fgs(
 
         with open(save_path, "w", encoding="utf-8") as f:
             f.writelines(new_lines)
-        return True
+        return save_path
     except Exception as e:
         QMessageBox.critical(
             parent_widget, "Save Error", f"Could not save Static FGS:\n{str(e)}"
         )
-        return False
+        return None

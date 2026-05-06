@@ -533,8 +533,11 @@ class MainUI(QMainWindow):
         self.plotter.set_x_label(label)
 
     def is_dirty(self) -> bool:
-        if not self.filepath:
+        if self._current_event is None:
             return False
+            
+        if self.filepath is None:
+            return True
 
         if self.current_data != self.original_data:
             return True
@@ -571,11 +574,13 @@ class MainUI(QMainWindow):
             data = self.current_data.get(ch_key, {})
             xs = data.get("x", [])
             ys = data.get("y", [])
-            
+
             # Point count check
             max_pts = 14 if ch == "Y" else 10
             if len(xs) > max_pts:
-                all_errors.append(f"Channel {ch}: Too many scaling points ({len(xs)} > {max_pts}).")
+                all_errors.append(
+                    f"Channel {ch}: Too many scaling points ({len(xs)} > {max_pts})."
+                )
 
             ar_coeffs = coeffs[:pure_ar_count] if ch in ("Cb", "Cr") else coeffs
             errors = fgs_math.validate_fgs_pipeline(ar_coeffs, ar_shift, ys)
@@ -948,18 +953,16 @@ class MainUI(QMainWindow):
             self._update_last_known_state()
 
     def save_file(self):
+        start_t, end_t = None, None
+        if self._current_event:
+            start_t, end_t = self.sidebar.get_event_time_bounds()
+            self._current_event["start_time"] = start_t
+            self._current_event["end_time"] = end_t
+        
         if not self.filepath:
-            # If no filepath, we might need a default name or just let save_static_fgs ask
-            start_t, end_t = None, None
-            if self._current_event:
-                start_t, end_t = self.sidebar.get_event_time_bounds()
+            pass # Keep default behaviors later on
         else:
-            start_t, end_t = None, None
-            # Sync times from the Time panel
-            if self._current_event is not None:
-                start_t, end_t = self.sidebar.get_event_time_bounds()
-                self._current_event["start_time"] = start_t
-                self._current_event["end_time"] = end_t
+            pass
 
         errors = self._get_validation_errors()
         if errors:
@@ -1005,7 +1008,7 @@ class MainUI(QMainWindow):
             if msg_box.clickedButton() == save_as_btn:
                 force_path = None
 
-        saved = save_static_fgs(
+        saved_path = save_static_fgs(
             self,
             original_filepath=self.filepath,
             scale_data=self.current_data,
@@ -1018,7 +1021,9 @@ class MainUI(QMainWindow):
             force_path=force_path,
         )
 
-        if saved:
+        if saved_path:
+            self.filepath = saved_path
+            self.file_label.setText(f"Editing: {os.path.basename(self.filepath)}")
             self.original_data = copy.deepcopy(self.current_data)
             self.original_p_params = self.sidebar.get_p_params()
             self.original_grain_size = self.sidebar.get_grain_size()
@@ -1067,10 +1072,18 @@ class MainUI(QMainWindow):
         # Ask for output video path
         src_base = os.path.splitext(os.path.basename(self._video_path))
         src_ext = src_base[1] if len(src_base) > 1 else ".mkv"
-        default_out = os.path.join(
-            os.path.dirname(self._video_path),
-            f"{src_base[0]}_applied{src_ext}",
-        )
+        video_dir = os.path.dirname(self._video_path)
+
+        base_name_candidate = f"{src_base[0]}_fgs_applied"
+        default_out = os.path.join(video_dir, f"{base_name_candidate}{src_ext}")
+        idx = 0
+        while os.path.exists(default_out) or os.path.exists(
+            os.path.join(video_dir, f"{base_name_candidate}.txt")
+        ):
+            idx += 1
+            base_name_candidate = f"{src_base[0]}_fgs_applied ({idx})"
+            default_out = os.path.join(video_dir, f"{base_name_candidate}{src_ext}")
+
         output_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Output Video",
@@ -1080,24 +1093,10 @@ class MainUI(QMainWindow):
         if not output_path:
             return
 
-        # Save FGS to a file next to the input video so the user can inspect it
-        import tempfile
+        out_dir = os.path.dirname(output_path)
+        out_base = os.path.splitext(os.path.basename(output_path))[0]
+        tmp_fgs = os.path.join(out_dir, f"{out_base}.txt")
 
-        if self._video_path:
-            video_dir = os.path.dirname(self._video_path)
-            video_base = os.path.splitext(os.path.basename(self._video_path))[0]
-            candidate = os.path.join(video_dir, f"{video_base}.txt")
-            idx = 0
-            # find a non-conflicting filename
-            while os.path.exists(candidate):
-                idx += 1
-                candidate = os.path.join(video_dir, f"{video_base} ({idx}).txt")
-            tmp_fgs = candidate
-        else:
-            tmp_dir = tempfile.mkdtemp(prefix="fgseditor_apply_")
-            tmp_fgs = os.path.join(tmp_dir, "grain_table.txt")
-
-        # Build the FGS content
         p_params = self.sidebar.get_p_params() if self._current_event else None
         event_raw_lines = (
             self._current_event.get("raw_lines") if self._current_event else None

@@ -425,7 +425,9 @@ class InteractiveFGSPlotter(QWidget):
                 limit = 14 if ch == "sY" else 10
                 if len(self.current_data[ch]["x"]) >= limit:
                     QMessageBox.warning(
-                        self, "Limit", f"You cannot exceed {limit} points for this channel."
+                        self,
+                        "Limit",
+                        f"You cannot exceed {limit} points for this channel.",
                     )
                 else:
                     new_x = max(16, min(235, x_val))

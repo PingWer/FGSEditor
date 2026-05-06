@@ -92,7 +92,7 @@ class PanelPhotonNoise(QWidget):
             reply = QMessageBox.question(
                 self,
                 "Overwrite Warning",
-                "Stai per perdere i valori originali sY, sCb, sCr.\nContinuare?",
+                "You are about to lose the original sY, sCb, sCr values.\nContinue?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )

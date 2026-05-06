@@ -84,7 +84,7 @@ def get_chroma_scaling_index(
 ) -> int:
     combined = luma_val * (luma_mult - 128) + chroma_val * (mult - 128)
     index = (combined >> 6) + (offset - 256)
-    return max(0, min(255, index))
+    return _clip3(0, 255, index)
 
 
 def build_chroma_deterministic_curve(

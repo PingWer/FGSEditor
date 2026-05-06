@@ -828,7 +828,7 @@ class DynamicTimelineUI(QWidget):
             video_base = os.path.splitext(os.path.basename(self.main_ui._video_path))[0]
             default_name = f"{video_base}.txt"
 
-        saved = save_dynamic_fgs(
+        saved_path = save_dynamic_fgs(
             self,
             original_filepath=self.filepath,
             header_lines=self.header_lines,
@@ -836,7 +836,9 @@ class DynamicTimelineUI(QWidget):
             default_name=default_name,
             force_path=self.filepath,
         )
-        if saved:
+        if saved_path:
+            self.filepath = saved_path
+            self.file_label.setText(f"File: {self.filepath}")
             self.original_events = copy.deepcopy(self.events)
             self.original_fps_text = self.fps_combo.currentText()
             self._update_ui_state()
