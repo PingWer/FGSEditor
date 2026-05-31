@@ -5,3 +5,5 @@
 /fgseditor_qt/__pycache__
 *.spec
 *.pyc
+setting.json
+/Templates/user

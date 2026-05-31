@@ -7,11 +7,11 @@ The editor supports both **static FGS** (single event) and **dynamic FGS** (mult
 ## 🚀 Features
 - Grain value-strength tuning on Luma and Chroma independently
 - Dynamic control of value-strength points and interpolated values visualization
-- Easy clear on sets of values in individual events
 - Edit start-end timestamp of individual events with milliseconds precision
 - Entire FGS events visualization on an average strength - seconds plot
-- Drag and drop supported
-- Built-in grain presets and template system
+- Extract video duration and FPS directly from AV1 and HEVC videos
+- Robust Autosave system with backups to prevent data loss
+- Detailed Settings menu to tune visual colors, timeline fallbacks, and performance constraints
 - Mathematical grain strength preview
 
 ## 📥 Installation & Usage
@@ -35,10 +35,12 @@ build.bat
 A full Wiki with parameter references and usage guides is available on the [GitHub Wiki](../../wiki).
 
 ## 📋 Roadmap & TODO
-- [ ] Add the ability to insert new events into a dynamic FGS.
+- [x] Add the ability to insert new events into a dynamic FGS.
 - [ ] Implement automatic FGS optimization.
 - [x] Add built-in presets for various types of grain/events.
 - [x] Add Linux support
+- [ ] Add the ability to automatically generate FGS tables from a video.
+- [ ] Add the possibility to preview in realtime the FGS on a video.
 
 ## 📜 Licenses & Copyright
 All third-party licenses and copyright notices are listed in [`NOTICE.md`](NOTICE.md), which is also accessible from within the application under **Licenses & Copyright**.
@@ -46,6 +48,3 @@ All third-party licenses and copyright notices are listed in [`NOTICE.md`](NOTIC
 ## 🤝 Contributing
 Contributions are always welcome! Feel free to open an issue to report bugs or request features, or submit a Pull Request if you'd like to contribute directly to the code.
 You can find me in the [AV1 Weeb Discord Server](https://discord.gg/bZPrC2cmP6)
-
-## 🔮 Future Expansions
-- **`vs-view` Plugin Integration:** Development of a dedicated plugin for [`vs-view`](https://github.com/Jaded-Encoding-Thaumaturgy/vs-view). This will allow users to create an FGS and instantly preview the grain applied to the video directly during the filtering process on VapourSynth.

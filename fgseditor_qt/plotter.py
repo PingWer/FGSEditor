@@ -30,10 +30,11 @@ class InteractiveFGSPlotter(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.canvas)
 
+        from .settings_manager import get_setting
         self.styles = {
-            "sY": {"color": "#2ca02c", "label": "Luma (sY)", "marker": "o"},
-            "sCb": {"color": "#1f77b4", "label": "Chroma (sCb)", "marker": "s"},
-            "sCr": {"color": "#d62728", "label": "Chroma (sCr)", "marker": "^"},
+            "sY": {"color": get_setting("plotter_color_luma", "#00ff00"), "label": "Luma (sY)", "marker": "o"},
+            "sCb": {"color": get_setting("plotter_color_cb", "#0088ff"), "label": "Chroma (sCb)", "marker": "s"},
+            "sCr": {"color": get_setting("plotter_color_cr", "#ff3333"), "label": "Chroma (sCr)", "marker": "^"},
         }
 
         self.active_channel = "sY"
@@ -110,8 +111,14 @@ class InteractiveFGSPlotter(QWidget):
         if event.key != "control":
             return
 
-        base_scale = 1.25
-        scale_factor = 1.0 / base_scale if event.button == "up" else base_scale
+        from .settings_manager import get_setting
+        zoom_sensitivity = get_setting("plotter_zoom_sensitivity", 1.2)
+        base_scale = zoom_sensitivity
+
+        if event.button == "up":
+            scale_factor = 1 / base_scale
+        elif event.button == "down":
+            scale_factor = base_scale
 
         cur_xlim = self.ax.get_xlim()
         cur_ylim = self.ax.get_ylim()
@@ -172,14 +179,24 @@ class InteractiveFGSPlotter(QWidget):
         self.refresh()
 
     def close_plot(self):
-        self.ax.clear()
-        self.figure.clear()
-        self.canvas.deleteLater()
-        self.annot = None
-        self.ax = None
-        self.figure = None
-        self.canvas = None
-        self.lines = {}
+        self.current_data = {
+            "sY": {"x": [], "y": []},
+            "sCb": {"x": [], "y": []},
+            "sCr": {"x": [], "y": []},
+        }
+        self.lines.clear()
+        self._user_xlim = None
+        self._user_ylim = None
+        if self.ax is not None:
+            self.ax.clear()
+            self.ax.set_facecolor("#111111")
+            self.ax.set_title("Film Grain Strength Interactive Plot", color="white")
+            self.ax.set_xlabel("Y Value", color="#cccccc")
+            self.ax.set_ylabel("Strength", color="#cccccc")
+            self.ax.tick_params(colors="white")
+            self.ax.grid(True, linestyle="--", color="#444444", alpha=0.5)
+        if self.canvas is not None:
+            self.canvas.draw_idle()
 
     def set_clip_extremes(self, extremes: dict | None, scaling_shift: int = 8) -> None:
         self._clip_extremes = extremes

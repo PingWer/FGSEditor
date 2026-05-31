@@ -22,6 +22,9 @@ if exist "grav1synth.exe" copy /y grav1synth.exe dist\grav1synth.exe
 echo Copying NOTICE.md...
 if exist "NOTICE.md" copy /y NOTICE.md dist\NOTICE.md
 
+echo Copying settings.json...
+if exist "settings.json" copy /y settings.json dist\settings.json
+
 echo.
 echo ==============================================
 echo Build completed successfully! 

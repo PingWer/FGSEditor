@@ -1,9 +1,9 @@
 from __future__ import annotations
 import re
+from typing import Sequence
 
 
 def natural_sort_key(s: str):
-    """Sort strings containing numbers in a human-friendly (natural) sort order."""
     return [
         int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", s)
     ]
@@ -26,6 +26,51 @@ def interpolate_scaling(xs: list[int], ys: list[int], luma: int) -> float:
         if xs[i] <= luma <= xs[i + 1]:
             return _lerp(ys[i], ys[i + 1], xs[i], xs[i + 1], luma)
     return 0.0
+
+
+def build_scaling_lut(xs: Sequence[int], ys: Sequence[int]) -> list[int]:
+    """Build the 256-entry integer ScalingLut as defined in AFGS1 spec section 8.2.4.
+
+    The spec uses fixed-point arithmetic (not float) to fill each entry:
+      delta = deltaY * ((65536 + (deltaX >> 1)) // deltaX)
+      lut[x0 + x] = y0 + ((x * delta + 32768) >> 16)
+
+    This produces the same table a compliant decoder would use.
+    """
+    lut: list[int] = [0] * 256
+    if not xs or not ys:
+        return lut
+
+    num_points = len(xs)
+    for i in range(xs[0]):
+        lut[i] = ys[0]
+
+    for i in range(num_points - 1):
+        x0, y0 = xs[i], ys[i]
+        x1, y1 = xs[i + 1], ys[i + 1]
+        delta_x = x1 - x0
+        delta_y = y1 - y0
+        if delta_x <= 0:
+            continue
+        delta = delta_y * ((65536 + (delta_x >> 1)) // delta_x)
+        for x in range(delta_x):
+            lut[x0 + x] = y0 + ((x * delta + 32768) >> 16)
+
+    for i in range(xs[-1], 256):
+        lut[i] = ys[-1]
+
+    return lut
+
+
+def scale_lut_10bit(lut: list[int], pixel_10bit: int) -> int:
+    shift = 2 
+    x = pixel_10bit >> shift
+    if x >= 255:
+        return lut[255]
+    rem = pixel_10bit - (x << shift)
+    start = lut[x]
+    end = lut[x + 1]
+    return start + ((((end - start) * rem) + (1 << (shift - 1))) >> shift)
 
 
 def _clip3(lo: int, hi: int, val: int) -> int:

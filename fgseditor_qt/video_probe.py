@@ -11,6 +11,11 @@ from .app_paths import get_base_dir
 
 
 def find_ffprobe() -> str | None:
+    from .settings_manager import get_setting
+    user_path = get_setting("ffprobe_path", "").strip()
+    if user_path and os.path.isfile(user_path) and os.access(user_path, os.X_OK):
+        return user_path
+
     base = get_base_dir()
     if sys.platform == "win32":
         candidates = ["ffprobe.exe"]
@@ -28,23 +33,93 @@ def find_ffprobe() -> str | None:
     return None
 
 
-def probe_video(filepath: str) -> dict:
-    """
-    Returns dict with keys:
-        codec       — e.g. "av1"
-        width       — int
-        height      — int
-        fps         — float (e.g. 23.976)
-        fps_num     — int   (e.g. 24000)
-        fps_den     — int   (e.g. 1001)
-        duration_s  — float (total duration in seconds)
-        num_frames  — int   (total frames, estimated if unavailable)
+def find_ffmpeg() -> str | None:
+    from .settings_manager import get_setting
+    user_path = get_setting("ffmpeg_path", "").strip()
+    if user_path and os.path.isfile(user_path) and os.access(user_path, os.X_OK):
+        return user_path
 
-    Raises:
-        FileNotFoundError  — ffprobe not found
-        ValueError         — not a supported file, no video stream, or not AV1 (for .mkv)
-        RuntimeError       — ffprobe execution failed
-    """
+    base = get_base_dir()
+    if sys.platform == "win32":
+        candidates = ["ffmpeg.exe"]
+    else:
+        candidates = ["ffmpeg"]
+
+    for name in candidates:
+        path = os.path.join(base, name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    return None
+
+
+def get_ffmpeg_version() -> str | None:
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        return None
+
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-version"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        if result.returncode != 0:
+            return None
+
+        first_line = result.stdout.splitlines()[0]
+        parts = first_line.split()
+        if (
+            len(parts) < 3
+            or parts[0].lower() != "ffmpeg"
+            or parts[1].lower() != "version"
+        ):
+            return None
+
+        return parts[2]
+    except Exception:
+        return None
+
+
+def check_ffmpeg_version(min_version: str = "8.0.0") -> bool:
+    version_str = get_ffmpeg_version()
+    if not version_str:
+        return False
+    if version_str.startswith("N-"):
+        return True
+
+    def parse_v(v):
+        v = v.split("-")[0]
+        parts = []
+        for x in v.split("."):
+            try:
+                parts.append(int(x))
+            except ValueError:
+                break
+        return parts
+
+    v_actual = parse_v(version_str)
+    v_min = parse_v(min_version)
+
+    max_len = max(len(v_actual), len(v_min))
+    v_actual += [0] * (max_len - len(v_actual))
+    v_min += [0] * (max_len - len(v_min))
+
+    return v_actual >= v_min
+
+
+def probe_video(filepath: str) -> dict:
+    if not check_ffmpeg_version():
+        raise RuntimeError(
+            "ffmpeg version is too old.\n\n"
+            "Please install at least FFmpeg 8.0 (which includes ffprobe) "
+            "and ensure it is in your system PATH, or place the ffprobe binary "
+            "next to the FGSEditor executable."
+        )
     ffprobe = find_ffprobe()
     if ffprobe is None:
         raise FileNotFoundError(
@@ -55,9 +130,9 @@ def probe_video(filepath: str) -> dict:
         )
 
     ext = os.path.splitext(filepath)[1].lower()
-    if ext not in (".mkv", ".ivf"):
+    if ext not in (".mkv", ".ivf", ".mp4", ".hevc"):
         raise ValueError(
-            f"Unsupported file format: '{ext}'\nOnly .mkv and .ivf files are accepted."
+            f"Unsupported file format: '{ext}'\nOnly .mkv, .ivf, .mp4, and .hevc files are accepted."
         )
 
     cmd = [
@@ -102,10 +177,10 @@ def probe_video(filepath: str) -> dict:
 
     codec = (video_stream.get("codec_name") or "").lower()
 
-    if ext == ".mkv" and codec != "av1":
+    if ext == ".mkv" and codec not in ("av1", "hevc"):
         raise ValueError(
-            f"The MKV file contains '{codec}' video, not AV1.\n"
-            "Only AV1 video is supported."
+            f"The MKV file contains '{codec}' video.\n"
+            "Only AV1 or HEVC video is supported."
         )
 
     width = _safe_int(video_stream.get("width"), 0)
@@ -118,7 +193,7 @@ def probe_video(filepath: str) -> dict:
     num_frames = _parse_frame_count(video_stream, duration_s, fps)
 
     return {
-        "codec": codec if codec else "av1",
+        "codec": codec,
         "width": width,
         "height": height,
         "fps": fps,

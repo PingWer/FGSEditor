@@ -242,7 +242,10 @@ def compute_amplitude_at_point(
     scaling_shift: int,
 ) -> float:
     """
-    Compute the grain delta at a specific curve point.
+    Compute the grain delta at a specific curve point (UI/plotter use, float).
+
+    NOTE: This uses float interpolation and is suitable for the timeline plotter.
+    For bit-exact 10-bit synthesis use compute_amplitude_at_pixel_10bit().
 
     Mathematical breakdown:
     1. The grain template (grain_extreme) is in 12-bit signed domain (+-2048).
@@ -251,7 +254,34 @@ def compute_amplitude_at_point(
 
     Total divisor = 2^(scaling_shift + 2 + 2) = 2^(scaling_shift + 4).
     """
-    # Total shift to get from 12-bit template to 8-bit UI representation
     total_shift = scaling_shift + 4
     delta_8bit = (grain_extreme * scaling_value) / (1 << total_shift)
     return delta_8bit
+
+
+def compute_amplitude_at_pixel_10bit(
+    grain_value: int,
+    scaling_lut: list[int],
+    pixel_10bit: int,
+    scaling_shift: int,
+) -> int:
+    """
+    Compute the exact integer grain delta for a specific 10-bit pixel.
+    Spec-compliant (AFGS1 section 8.2.5).
+
+    Args:
+        grain_value:   Raw grain template value (12-bit signed, range +-2048).
+        scaling_lut:   Pre-built 256-entry LUT from build_scaling_lut().
+        pixel_10bit:   The original pixel value in 10-bit (0-1023).
+        scaling_shift: grain_scaling_minus8 + 8 (the ScalingShift from the spec).
+
+    Returns:
+        Integer noise delta to add to the original pixel, in 10-bit units.
+    """
+    from .fgs_math import scale_lut_10bit
+
+    scaling_factor = scale_lut_10bit(scaling_lut, pixel_10bit)
+    product = grain_value * scaling_factor
+    # Round2(value, n) = (value + (1 << (n-1))) >> n
+    noise = (product + (1 << (scaling_shift - 1))) >> scaling_shift
+    return noise

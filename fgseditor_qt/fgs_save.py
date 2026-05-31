@@ -12,14 +12,14 @@ def _expected_coeff_count(ar_coeff_lag: int) -> int:
 def _build_scale_line(prefix: str, data: dict) -> str:
     # AV1 spec limits: 14 points for Luma (sY), 10 points for Chroma (sCb, sCr)
     max_pts = 14 if prefix == "sY" else 10
-    
+
     x_list = data.get("x", [])
     y_list = data.get("y", [])
-    
+
     if len(x_list) > max_pts:
         x_list = x_list[:max_pts]
         y_list = y_list[:max_pts]
-    
+
     pts = len(x_list)
     if pts == 0:
         return f"  {prefix} 0\n"
@@ -193,6 +193,24 @@ def save_dynamic_fgs(
     default_name: str = "modified_fgs.txt",
     force_path: str | None = None,
 ) -> str | None:
+    has_chroma_luma = any(
+        fgs_parser.get_p_params(ev).get("chroma_scaling_from_luma", 0) == 1
+        for ev in events
+    )
+    if has_chroma_luma:
+        reply = QMessageBox.warning(
+            parent_widget,
+            "x265 Compatibility Warning",
+            "You have enabled 'Chroma Scaling from Luma'.\n\n"
+            "Warning: Currently, the x265 encoder (including Patman's mod) does NOT support this feature "
+            "and will completely ignore Chroma grain if this is enabled.\n\n"
+            "Do you want to continue saving?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.No:
+            return None
+
     if force_path:
         save_path = force_path
     else:
@@ -232,6 +250,20 @@ def save_static_fgs(
     default_name: str = "modified_fgs.txt",
     force_path: str | None = None,
 ) -> str | None:
+    if p_params and p_params.get("chroma_scaling_from_luma", 0) == 1:
+        reply = QMessageBox.warning(
+            parent_widget,
+            "x265 Compatibility Warning",
+            "You have enabled 'Chroma Scaling from Luma'.\n\n"
+            "Warning: Currently, the x265 encoder does NOT support this feature "
+            "and will completely ignore Chroma grain if this is enabled.\n\n"
+            "Do you want to continue saving?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.No:
+            return None
+
     if force_path:
         save_path = force_path
     else:
@@ -248,13 +280,11 @@ def save_static_fgs(
         return None
 
     try:
-        # Load header and E from existing file if we are modifying
         final_original = []
         if original_filepath and os.path.exists(original_filepath):
             with open(original_filepath, "r", encoding="utf-8") as fh:
                 file_lines = fh.readlines()
 
-            # Extract up to E
             for line in file_lines:
                 final_original.append(line)
                 if line.strip().startswith("E "):

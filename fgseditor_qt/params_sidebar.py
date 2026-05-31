@@ -24,6 +24,7 @@ class ParamsSidebar(QWidget):
     photon_noise_changed = Signal(dict)
     template_apply_requested = Signal(dict, int)
     time_changed = Signal(object, object)
+    fps_or_mode_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -81,6 +82,7 @@ class ParamsSidebar(QWidget):
         self.panel_templates = PanelTemplates(self)
         self.panel_time = PanelTime(self)
         self.panel_time.time_changed.connect(self.time_changed)
+        self.panel_time.fps_or_mode_changed.connect(self.fps_or_mode_changed)
 
         content_layout.addWidget(self.panel_fgs)
         content_layout.addWidget(self.panel_grain)
@@ -246,6 +248,7 @@ class ParamsSidebar(QWidget):
             "grain_seed": self.get_seed(),
         }
         state.update(self.panel_photon.get_state())
+        state.update(self.panel_time.get_state())
         return state
 
     def set_full_state(self, state: dict) -> None:
@@ -261,5 +264,6 @@ class ParamsSidebar(QWidget):
         self.panel_fgs.set_seed(state.get("grain_seed", 7391))
 
         self.panel_photon.set_state(state)
+        self.panel_time.set_state(state)
 
         self._suppress = False

@@ -175,7 +175,7 @@ def get_grain_seed(event: dict) -> int:
             return int(params[1])
         except (ValueError, TypeError):
             pass
-    return 6967  # fallback default
+    return 3  # fallback default
 
 
 def set_grain_seed(event: dict, seed: int) -> None:

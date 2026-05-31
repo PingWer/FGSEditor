@@ -9,6 +9,11 @@ from .app_paths import get_base_dir
 
 
 def get_grav1synth_path() -> str | None:
+    from .settings_manager import get_setting
+    user_path = get_setting("grav1synth_path", "").strip()
+    if user_path and os.path.isfile(user_path) and os.access(user_path, os.X_OK):
+        return user_path
+
     base = get_base_dir()
     if sys.platform == "win32":
         candidates = ["grav1synth.exe"]

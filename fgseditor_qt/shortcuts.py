@@ -17,7 +17,7 @@ def show_credits(parent=None):
     msg = QMessageBox(parent)
     msg.setWindowTitle(" ")
     msg.setText(
-        "FGSEditor v3.1.2\n\n"
+        "FGSEditor v4.0.0\n\n"
         'Copyright \u00a9 2026 Michele "PingWer" Cosentino\n\n'
         'Collaborators:\nManuel "Mhanz3500" Moscardi'
     )
@@ -120,7 +120,14 @@ def create_standard_menu(
     menu_bar.addMenu(shortcuts_menu)
 
     settings_menu = QMenu("Settings", menu_bar)
-    settings_menu.addAction("Coming soon…").setEnabled(False)
+    action_settings = settings_menu.addAction("Preferences...")
+    
+    def _open_settings():
+        from .settings_dialog import SettingsDialog
+        dlg = SettingsDialog(parent)
+        dlg.exec()
+        
+    action_settings.triggered.connect(_open_settings)
     menu_bar.addMenu(settings_menu)
 
     info_menu = QMenu("Info", menu_bar)

@@ -11,9 +11,11 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QSizePolicy,
     QFrame,
-    QMenu,
     QComboBox,
     QLineEdit,
+    QStackedWidget,
+    QProgressBar,
+    QCheckBox,
 )
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -34,14 +36,18 @@ from .time_utils import (
     ticks_to_seconds,
     seconds_to_ticks,
 )
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from functools import lru_cache
+import datetime
+from .settings_manager import get_setting
 
 # Maximum number of event labels rendered (to avoid clutter + slowness)
 _MAX_LABELS = 50
 
+_cache_size = get_setting("fgs_grain_cache_size", 128)
 
-@lru_cache(maxsize=128)
+
+@lru_cache(maxsize=_cache_size)
 def _cached_compute_grain_extremes(
     seed, ar_lag, ar_shift, grain_scale_shift, cy_coeffs_tuple
 ):
@@ -69,7 +75,6 @@ def _process_timeline_event(args):
     i, key, ev = args
     from . import fgs_parser
     from .fgs_grain_sim import compute_amplitude_at_point
-    from .dynamic_ui import _cached_compute_grain_extremes
 
     evt_ctx = {"p_params": ev.get("p_params", fgs_parser.P_DEFAULTS)}
     ar_shift = fgs_parser.get_ar_coeff_shift(evt_ctx)
@@ -103,6 +108,7 @@ def _process_timeline_event(args):
 
 class TimelineDataWorker(QThread):
     finished_data = Signal(object)
+    progress = Signal(int)
 
     def __init__(self, missing_events):
         super().__init__()
@@ -112,13 +118,37 @@ class TimelineDataWorker(QThread):
 
     def run(self):
         import concurrent.futures
+        import os
 
         if not self.missing_events:
+            self.progress.emit(100)
             self.finished_data.emit([])
             return
 
-        with concurrent.futures.ProcessPoolExecutor() as executor:
-            results = list(executor.map(_process_timeline_event, self.missing_events))
+        from .settings_manager import get_setting
+
+        num_cores = os.cpu_count() or 1
+        max_workers = get_setting("timeline_max_workers", num_cores)
+        max_workers = max(1, min(max_workers, num_cores * 2))
+
+        chunksize = max(1, len(self.missing_events) // (max_workers * 4))
+
+        results = []
+        total = len(self.missing_events)
+
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+            for i, result in enumerate(
+                executor.map(
+                    _process_timeline_event,
+                    self.missing_events,
+                    chunksize=chunksize,
+                )
+            ):
+                results.append(result)
+                if i % max(1, total // 100) == 0 or i == total - 1:
+                    self.progress.emit(int((i + 1) / total * 100))
 
         self.finished_data.emit(results)
 
@@ -138,8 +168,19 @@ class DynamicTimelineUI(QWidget):
 
         self.original_fps_text = DEFAULT_FPS_LABEL
 
-        self._undo_stack = deque(maxlen=100)
-        self._redo_stack = deque(maxlen=100)
+        from .settings_manager import get_setting
+
+        undo_size = get_setting("undo_stack_size", 100)
+        self._undo_stack = deque(maxlen=undo_size)
+        self._redo_stack = deque(maxlen=undo_size)
+
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.timeout.connect(self._do_autosave)
+        from .settings_manager import get_setting
+
+        interval_min = get_setting("autosave_interval_minutes", 5)
+        if interval_min > 0:
+            self.autosave_timer.start(interval_min * 60000)
 
         # Zoom / pan state
         self._xlim_full: tuple[float, float] | None = None
@@ -147,6 +188,10 @@ class DynamicTimelineUI(QWidget):
         self._pan_active = False
         self._pan_start_x: float | None = None
         self._pan_xlim_start: tuple[float, float] | None = None
+
+        self._select_active = False
+        self._select_start_x: float | None = None
+        self._select_overlay = None
 
         # Pre-computed per-event data (rebuilt in build_timeline)
         self._ev_t_start: list[float] = []
@@ -182,9 +227,7 @@ class DynamicTimelineUI(QWidget):
         mid_frame.setObjectName("toolbar")
         mid_layout = QHBoxLayout(mid_frame)
 
-        info_label = QLabel(
-            f"{len(self.events)} event(s) detected | Click a segment to edit that event"
-        )
+        info_label = QLabel(f"{len(self.events)} event(s) detected")
         info_label.setStyleSheet("color: #4da6ff;")
         mid_layout.addWidget(info_label, stretch=1)
 
@@ -194,9 +237,12 @@ class DynamicTimelineUI(QWidget):
 
         self.fps_combo = QComboBox()
         self.fps_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        from .settings_manager import get_setting
+
+        default_fps = get_setting("default_fps", "24")
         for lbl, _ in COMMON_FPS:
             self.fps_combo.addItem(lbl)
-        self.fps_combo.setCurrentText(DEFAULT_FPS_LABEL)
+        self.fps_combo.setCurrentText(default_fps)
         self.fps_combo.setToolTip(
             "Frame rate used to display and input event timestamps as frame numbers"
         )
@@ -210,7 +256,10 @@ class DynamicTimelineUI(QWidget):
         self.time_format_combo = QComboBox()
         self.time_format_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.time_format_combo.addItems(["Seconds", "Frames", "Timestamp"])
-        self.time_format_combo.setCurrentText("Seconds")
+        default_fmt = get_setting("default_time_format", "Frames")
+        if default_fmt == "Timecode":
+            default_fmt = "Timestamp"
+        self.time_format_combo.setCurrentText(default_fmt)
         self.time_format_combo.setToolTip(
             "Display timeline in seconds, frames (based on FPS), or HH:MM:SS:mmm format"
         )
@@ -230,6 +279,11 @@ class DynamicTimelineUI(QWidget):
         self.save_btn.clicked.connect(self.save_fgs)
         mid_layout.addWidget(self.save_btn, stretch=0)
 
+        self.save_bin_btn = QPushButton("Save Binary")
+        self.save_bin_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.save_bin_btn.clicked.connect(self.save_binary)
+        mid_layout.addWidget(self.save_bin_btn, stretch=0)
+
         self.reset_zoom_btn = QPushButton("⟳ Reset Zoom")
         self.reset_zoom_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.reset_zoom_btn.setToolTip(
@@ -245,13 +299,96 @@ class DynamicTimelineUI(QWidget):
 
         layout.addWidget(mid_frame)
 
+        te_container = QHBoxLayout()
+        te_container.addStretch(1)
+
+        self.time_edit_bar = QFrame()
+        self.time_edit_bar.setStyleSheet(
+            "background-color: #222222; border: 1px solid #4da6ff; border-radius: 4px;"
+        )
+        te_layout = QHBoxLayout(self.time_edit_bar)
+        te_layout.setContentsMargins(8, 4, 8, 4)
+
+        self.te_label = QLabel("Ev:")
+        self.te_label.setStyleSheet(
+            "color: white; font-weight: bold; border: none; background: transparent;"
+        )
+        te_layout.addWidget(self.te_label)
+
+        l1 = QLabel("Start:")
+        l1.setStyleSheet("color: white; background: transparent; border: none;")
+        te_layout.addWidget(l1)
+        self.te_start_input = QLineEdit()
+        self.te_start_input.setFixedWidth(100)
+        self.te_start_input.setStyleSheet("color: white; background: #111;")
+        te_layout.addWidget(self.te_start_input)
+
+        l2 = QLabel("End:")
+        l2.setStyleSheet("color: white; background: transparent; border: none;")
+        te_layout.addWidget(l2)
+        self.te_end_input = QLineEdit()
+        self.te_end_input.setFixedWidth(100)
+        self.te_end_input.setStyleSheet("color: white; background: #111;")
+        te_layout.addWidget(self.te_end_input)
+
+        self.te_alter_neighbor = QCheckBox("Alter neighbors")
+        self.te_alter_neighbor.setStyleSheet(
+            "color: white; border: none; background: transparent;"
+        )
+        te_layout.addWidget(self.te_alter_neighbor)
+
+        self.te_close_btn = QPushButton("✕")
+        self.te_close_btn.setFixedSize(20, 20)
+        self.te_close_btn.setStyleSheet(
+            "border: none; color: #ff4444; font-weight: bold; background: transparent;"
+        )
+        self.te_close_btn.clicked.connect(self._hide_time_edit_bar)
+        te_layout.addWidget(self.te_close_btn)
+
+        self.time_edit_bar.hide()
+        te_container.addWidget(self.time_edit_bar)
+        layout.addLayout(te_container)
+
+        self.main_stack = QStackedWidget()
+        layout.addWidget(self.main_stack, stretch=1)
+
         self.figure = Figure(figsize=(10, 3), dpi=100)
         self.ax = self.figure.add_subplot(111)
         self.figure.patch.set_facecolor("#1e1e1e")
         self.ax.set_facecolor("#111111")
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setStyleSheet("background-color: #1e1e1e;")
-        layout.addWidget(self.canvas, stretch=1)
+        self.main_stack.addWidget(self.canvas)
+        # Code removed from here as it was moved up
+
+        self._editing_event_idx = -1
+        self.te_start_input.editingFinished.connect(
+            lambda: self._apply_inline_edit(True)
+        )
+        self.te_end_input.editingFinished.connect(
+            lambda: self._apply_inline_edit(False)
+        )
+
+        self.te_start_input.installEventFilter(self)
+        self.te_end_input.installEventFilter(self)
+
+        self.progress_container = QWidget()
+        self.progress_container.setStyleSheet("background-color: #1e1e1e;")
+        prog_layout = QVBoxLayout(self.progress_container)
+        prog_layout.setAlignment(Qt.AlignCenter)
+        self.progress_label = QLabel("Calculating timeline data...")
+        self.progress_label.setStyleSheet("color: white; font-size: 14px;")
+        self.progress_label.setAlignment(Qt.AlignCenter)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setMinimumWidth(300)
+        self.progress_bar.setStyleSheet(
+            "QProgressBar { border: 1px solid #444; border-radius: 5px; text-align: center; color: white; }"
+            "QProgressBar::chunk { background-color: #4da6ff; width: 20px; }"
+        )
+        prog_layout.addWidget(self.progress_label)
+        prog_layout.addWidget(self.progress_bar)
+        self.main_stack.addWidget(self.progress_container)
 
         self.build_timeline()
         self.canvas.mpl_connect("pick_event", self.on_pick)
@@ -326,9 +463,11 @@ class DynamicTimelineUI(QWidget):
         self._update_ui_state()
         if self.time_format_combo.currentText() == "Frames":
             self.build_timeline()
+        self._update_inline_edit_bar_text()
 
     def _on_time_format_changed(self, text: str):
         self.build_timeline()
+        self._update_inline_edit_bar_text()
 
     def closeEvent(self, event):
         if self.is_dirty():
@@ -361,23 +500,62 @@ class DynamicTimelineUI(QWidget):
         self.lines = []
         self._line_collection = None
         self._scatter_collection = None
+        self._select_overlay = None
         self._undo_stack.clear()
         self._redo_stack.clear()
 
         # Clean up MainUI state
         self.main_ui.filepath = None
         self.main_ui._current_event = None
-        self.main_ui.current_data = {}
-        self.main_ui.original_data = {}
-        self.main_ui.original_p_params = {}
-        self.main_ui.original_grain_size = 0
-        self.main_ui.plotter.set_data({})
-        self.main_ui.grain_preview.update_preview({})
+        self.main_ui._video_path = None
+        self.main_ui._video_info = None
+        self.main_ui.editor.close_plotters()
+        self.main_ui.editor.load_event(None)
+        self.main_ui.editor.set_video_info(None)
+        self.main_ui.editor.set_save_apply_enabled(False)
         self.main_ui.stacked_widget.setCurrentIndex(0)
         self.main_ui.setWindowTitle("FGSEditor")
 
+        if self.autosave_timer.isActive():
+            self.autosave_timer.stop()
+
         self.main_ui.show()
         super().closeEvent(event)
+
+    def _do_autosave(self):
+        if not self.is_dirty() or not self.events:
+            return
+
+        backup_dir = os.path.join(get_base_dir(), "backup")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        is_static = True
+        for ev in self.events:
+            flags = fgs_parser.get_p_params(ev)
+            if flags.get("overlap_flag", 1) == 1:
+                is_static = False
+                break
+
+        mode_str = "static" if is_static else "dynamic"
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+
+        if self.filepath and os.path.basename(self.filepath) != "Untitled":
+            base_name = os.path.splitext(os.path.basename(self.filepath))[0]
+        else:
+            base_name = "Untitled"
+
+        backup_filename = f"{base_name}_{timestamp}_{mode_str}.txt"
+        backup_path = os.path.join(backup_dir, backup_filename)
+
+        from .fgs_save import save_dynamic_fgs, save_static_fgs
+
+        try:
+            if is_static:
+                save_static_fgs(self.events, backup_path, self.header_lines)
+            else:
+                save_dynamic_fgs(self.events, backup_path, self.header_lines)
+        except Exception:
+            pass  # Silent fail for background autosave
 
     def _push_undo(self):
         self._undo_stack.append(copy.deepcopy(self.events))
@@ -442,8 +620,8 @@ class DynamicTimelineUI(QWidget):
                 missing_events.append((i, key, ev))
 
         if missing_events:
-            self.ax.set_title("Timeline Overview (Calculating...)", color="#f59e0b")
-            self.canvas.draw()
+            self.progress_bar.setValue(0)
+            self.main_stack.setCurrentWidget(self.progress_container)
             from PySide6.QtWidgets import QApplication
 
             QApplication.processEvents()
@@ -451,16 +629,19 @@ class DynamicTimelineUI(QWidget):
             if hasattr(self, "_timeline_worker") and self._timeline_worker.isRunning():
                 try:
                     self._timeline_worker.finished_data.disconnect()
+                    self._timeline_worker.progress.disconnect()
                 except Exception:
                     pass
 
             self._timeline_worker = TimelineDataWorker(missing_events)
+            self._timeline_worker.progress.connect(self.progress_bar.setValue)
             self._timeline_worker.finished_data.connect(self._on_timeline_data_ready)
             self._timeline_worker.start()
         else:
             self._on_timeline_data_ready([])
 
     def _on_timeline_data_ready(self, new_results):
+        self.main_stack.setCurrentWidget(self.canvas)
         if not hasattr(self, "_strength_cache"):
             self._strength_cache = {}
 
@@ -615,7 +796,7 @@ class DynamicTimelineUI(QWidget):
             self._label_artists.append(txt)
 
     def on_pick(self, event):
-        if event.mouseevent is None or event.mouseevent.button != 1 or self._pan_active:
+        if event.mouseevent is None or self._pan_active:
             return
         if event.artist not in (self._line_collection, self._scatter_collection):
             return
@@ -625,17 +806,366 @@ class DynamicTimelineUI(QWidget):
             return
         idx = int(indices[0])
 
+        if event.mouseevent.button == 1:
+            self._show_time_edit_bar(idx)
+        elif event.mouseevent.button == 3:
+            self._show_context_menu(idx, event.mouseevent.xdata)
+
+    def _show_context_menu(self, idx, xdata):
         from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
         action_edit = menu.addAction("Modify Event")
         action_dur = menu.addAction("Change time bounds")
+        menu.addSeparator()
+
+        action_add = menu.addAction("Add Event Here")
+
+        menu.addSeparator()
+        del_menu = menu.addMenu("Delete")
+        action_del_simple = del_menu.addAction("Delete only")
+        action_del_align = del_menu.addAction("Delete and align with neighbours")
+        action_del_interp = del_menu.addAction("Delete and interpolate with neighbours")
+
+        if idx == 0 or idx == len(self.events) - 1:
+            action_del_interp.setEnabled(False)
 
         action = menu.exec(QCursor.pos())
         if action == action_edit:
             self.open_editor(idx)
         elif action == action_dur:
             self.edit_time_bounds(idx)
+        elif action == action_add:
+            self._add_event_from_context(idx, xdata)
+        elif action == action_del_simple:
+            self._delete_event_simple(idx)
+        elif action == action_del_align:
+            self._delete_event_align(idx)
+        elif action == action_del_interp:
+            self._delete_event_interpolate(idx)
+
+    def _delete_event_simple(self, idx):
+        self._push_undo()
+        self.events.pop(idx)
+        self.build_timeline()
+        self._update_ui_state()
+
+    def _delete_event_align(self, idx):
+        self._push_undo()
+        ev = self.events[idx]
+        t_start = ev["start_time"]
+        t_end = ev["end_time"]
+
+        has_prev = idx > 0
+        has_next = idx < len(self.events) - 1
+
+        self.events.pop(idx)
+
+        if has_prev and has_next:
+            mid_t = (t_start + t_end) // 2
+            self.events[idx - 1]["end_time"] = mid_t
+            self.events[idx]["start_time"] = mid_t
+        elif has_prev:
+            self.events[idx - 1]["end_time"] = t_end
+        elif has_next:
+            self.events[idx]["start_time"] = t_start
+
+        self.build_timeline()
+        self._update_ui_state()
+
+    def _delete_event_interpolate(self, idx):
+        has_prev = idx > 0
+        has_next = idx < len(self.events) - 1
+        if not (has_prev and has_next):
+            return
+
+        self._push_undo()
+        ev_L = self.events[idx - 1]
+        ev_R = self.events[idx + 1]
+        target_start = self.events[idx]["start_time"]
+        target_end = self.events[idx]["end_time"]
+
+        import math
+        from . import fgs_parser
+        from .fgs_save import _build_p_line, _build_scale_line, _build_c_line
+
+        p_L = fgs_parser.get_p_params(ev_L)
+        p_R = fgs_parser.get_p_params(ev_R)
+        new_p = {}
+        for k in fgs_parser.P_DEFAULTS:
+            v_L = p_L.get(k, fgs_parser.P_DEFAULTS[k])
+            v_R = p_R.get(k, fgs_parser.P_DEFAULTS[k])
+            new_p[k] = math.ceil((v_L + v_R) / 2.0)
+
+        sd_L = fgs_parser.get_scale_data(ev_L)
+        sd_R = fgs_parser.get_scale_data(ev_R)
+        new_sd = {}
+        for ch in ("sY", "sCb", "sCr"):
+            x_L = sd_L.get(ch, {}).get("x", [])
+            y_L = sd_L.get(ch, {}).get("y", [])
+            x_R = sd_R.get(ch, {}).get("x", [])
+            y_R = sd_R.get(ch, {}).get("y", [])
+            ml = min(len(x_L), len(x_R))
+            new_x = [int(round((a + b) / 2.0)) for a, b in zip(x_L[:ml], x_R[:ml])]
+            new_y = [int(round((a + b) / 2.0)) for a, b in zip(y_L[:ml], y_R[:ml])]
+            new_sd[ch] = {"x": new_x, "y": new_y}
+
+        cy_L, cb_L, cr_L = fgs_parser.extract_ar_coeffs_from_raw_lines(
+            ev_L.get("raw_lines", [])
+        )
+        cy_R, cb_R, cr_R = fgs_parser.extract_ar_coeffs_from_raw_lines(
+            ev_R.get("raw_lines", [])
+        )
+
+        def avg_coeffs(c1, c2):
+            ml = min(len(c1), len(c2))
+            return [int(round((a + b) / 2.0)) for a, b in zip(c1[:ml], c2[:ml])]
+
+        new_cy = avg_coeffs(cy_L, cy_R)
+        new_cb = avg_coeffs(cb_L, cb_R)
+        new_cr = avg_coeffs(cr_L, cr_R)
+
+        lag = new_p.get("ar_coeff_lag", 3)
+        new_lines = []
+        new_lines.append(_build_p_line(new_p))
+        for ch in ("sY", "sCb", "sCr"):
+            new_lines.append(_build_scale_line(ch, new_sd[ch]))
+        new_lines.append(_build_c_line("cY", new_cy, lag))
+        new_lines.append(_build_c_line("cCb", new_cb, lag))
+        new_lines.append(_build_c_line("cCr", new_cr, lag))
+
+        ep = list(ev_L.get("extra_params", ["1", "7391", "1"]))
+
+        new_ev = {
+            "start_time": target_start,
+            "end_time": target_end,
+            "extra_params": ep,
+            "raw_lines": new_lines,
+            "scale_data": new_sd,
+            "p_params": new_p,
+        }
+
+        self.events[idx] = new_ev
+        self.build_timeline()
+        self._update_ui_state()
+
+    def _add_event_from_context(self, idx, click_xdata):
+        fps = self._current_fps()
+        click_ticks = seconds_to_ticks(click_xdata)
+        click_frame = ticks_to_frames(click_ticks, fps)
+
+        new_ev_start = frames_to_ticks(click_frame, fps)
+        new_ev_end = frames_to_ticks(click_frame + 1, fps)
+
+        ev = self.events[idx]
+        if new_ev_start <= ev["start_time"]:
+            new_ev_start = ev["start_time"]
+            new_ev_end = frames_to_ticks(ticks_to_frames(new_ev_start, fps) + 1, fps)
+        if new_ev_end >= ev["end_time"]:
+            new_ev_end = ev["end_time"]
+            new_ev_start = frames_to_ticks(ticks_to_frames(new_ev_end, fps) - 1, fps)
+
+        if new_ev_start >= new_ev_end:
+            return
+
+        import os
+        from .app_paths import get_base_dir
+        from .fgs_parser import parse_fgs_events
+
+        default_path = os.path.join(
+            get_base_dir(), "Templates", "system", "default.txt"
+        )
+        new_ev = copy.deepcopy(ev)
+        try:
+            with open(default_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                _, def_events = parse_fgs_events(content)
+                if def_events:
+                    new_ev = def_events[0]
+        except Exception:
+            pass
+
+        new_ev["start_time"] = new_ev_start
+        new_ev["end_time"] = new_ev_end
+
+        self._push_undo()
+
+        right_ev = copy.deepcopy(ev)
+        right_ev["start_time"] = new_ev_end
+
+        ev["end_time"] = new_ev_start
+
+        self.events.insert(idx + 1, new_ev)
+        self.events.insert(idx + 2, right_ev)
+
+        new_events = []
+        for e in self.events:
+            if e["start_time"] < e["end_time"]:
+                new_events.append(e)
+        self.events = new_events
+
+        self.build_timeline()
+        self._update_ui_state()
+
+    def _ticks_to_str(self, ticks):
+        fmt = self.time_format_combo.currentText()
+        fps = self._current_fps()
+        if fmt == "Frames":
+            return str(ticks_to_frames(ticks, fps))
+        elif fmt == "Seconds":
+            return f"{ticks_to_seconds(ticks):.4f}"
+        else:
+            return ticks_to_timecode(ticks)
+
+    def _str_to_ticks(self, text):
+        fmt = self.time_format_combo.currentText()
+        fps = self._current_fps()
+        try:
+            if fmt == "Frames":
+                t = frames_to_ticks(int(text), fps)
+            elif fmt == "Seconds":
+                t = seconds_to_ticks(float(text))
+            else:
+                t = timecode_to_ticks(text)
+            f = ticks_to_frames(t, fps)
+            return frames_to_ticks(f, fps)
+        except Exception:
+            return None
+
+    def _apply_inline_edit(self, is_start):
+        if not hasattr(self, "ax") or self.ax is None:
+            return
+        if self._editing_event_idx < 0 or self._editing_event_idx >= len(self.events):
+            return
+
+        idx = self._editing_event_idx
+        ev = self.events[idx]
+
+        new_start = self._str_to_ticks(self.te_start_input.text())
+        new_end = self._str_to_ticks(self.te_end_input.text())
+
+        if new_start is None or new_end is None:
+            self._update_inline_edit_bar_text()
+            return
+
+        old_start = ev["start_time"]
+        old_end = ev["end_time"]
+
+        if new_start == old_start and new_end == old_end:
+            return
+
+        if new_start >= new_end:
+            self._update_inline_edit_bar_text()
+            return
+
+        alter_neighbors = self.te_alter_neighbor.isChecked()
+        fps = self._current_fps()
+        min_frame_ticks = frames_to_ticks(1, fps) - frames_to_ticks(0, fps)
+
+        self._push_undo()
+
+        if not alter_neighbors:
+            if idx > 0:
+                prev_end = self.events[idx - 1]["end_time"]
+                if new_start < prev_end:
+                    new_start = prev_end
+            else:
+                if new_start < 0:
+                    new_start = 0
+
+            if idx < len(self.events) - 1:
+                next_start = self.events[idx + 1]["start_time"]
+                if new_end > next_start:
+                    new_end = next_start
+
+            if new_start >= new_end:
+                self.undo()
+                self._update_inline_edit_bar_text()
+                return
+
+            ev["start_time"] = new_start
+            ev["end_time"] = new_end
+        else:
+            ev["start_time"] = new_start
+            ev["end_time"] = new_end
+
+            if idx > 0:
+                prev_ev = self.events[idx - 1]
+                if new_start < prev_ev["start_time"] + min_frame_ticks:
+                    new_start = prev_ev["start_time"] + min_frame_ticks
+                    ev["start_time"] = new_start
+                prev_ev["end_time"] = new_start
+            else:
+                if new_start < 0:
+                    ev["start_time"] = 0
+
+            if idx < len(self.events) - 1:
+                next_ev = self.events[idx + 1]
+                if new_end > next_ev["end_time"] - min_frame_ticks:
+                    new_end = next_ev["end_time"] - min_frame_ticks
+                    ev["end_time"] = new_end
+                next_ev["start_time"] = new_end
+
+        self.build_timeline()
+        self._update_ui_state()
+        self._update_inline_edit_bar_text()
+
+    def _update_inline_edit_bar_text(self):
+        if 0 <= self._editing_event_idx < len(self.events):
+            ev = self.events[self._editing_event_idx]
+            self.te_start_input.blockSignals(True)
+            self.te_end_input.blockSignals(True)
+            self.te_start_input.setText(self._ticks_to_str(ev["start_time"]))
+            self.te_end_input.setText(self._ticks_to_str(ev["end_time"]))
+            self.te_start_input.blockSignals(False)
+            self.te_end_input.blockSignals(False)
+
+    def _show_time_edit_bar(self, idx):
+        self._editing_event_idx = idx
+        self.te_label.setText(f"Ev {idx + 1}:")
+        self.time_edit_bar.show()
+        self._update_inline_edit_bar_text()
+
+    def _hide_time_edit_bar(self):
+        self.time_edit_bar.hide()
+        self._editing_event_idx = -1
+
+    def eventFilter(self, obj, event):
+        from PySide6.QtCore import QEvent, Qt
+
+        if (
+            obj in (self.te_start_input, self.te_end_input)
+            and event.type() == QEvent.Wheel
+        ):
+            delta = event.angleDelta().y()
+            if delta != 0:
+                is_start = obj == self.te_start_input
+                modifier = event.modifiers()
+                step = 10 if (modifier & Qt.ShiftModifier) else 1
+                direction = 1 if delta > 0 else -1
+
+                self._apply_wheel_step(is_start, direction * step)
+                return True
+        return super().eventFilter(obj, event)
+
+    def _apply_wheel_step(self, is_start, frames_step):
+        if self._editing_event_idx < 0 or self._editing_event_idx >= len(self.events):
+            return
+
+        obj = self.te_start_input if is_start else self.te_end_input
+        current_ticks = self._str_to_ticks(obj.text())
+        if current_ticks is None:
+            return
+
+        fps = self._current_fps()
+        current_frames = ticks_to_frames(current_ticks, fps)
+        new_frames = current_frames + frames_step
+
+        new_ticks = frames_to_ticks(new_frames, fps)
+
+        obj.setText(self._ticks_to_str(new_ticks))
+        self._apply_inline_edit(is_start)
 
     def _current_fps(self) -> float:
         return fps_from_label(self.fps_combo.currentText())
@@ -808,8 +1338,10 @@ class DynamicTimelineUI(QWidget):
         self.editor.show()
 
     def save_fgs(self):
+        from .settings_manager import get_setting
+
         errors = self._get_validation_errors()
-        if errors:
+        if errors and get_setting("show_unsafe_warnings", True):
             error_text = "\n".join(errors)
             reply = QMessageBox.warning(
                 self,
@@ -819,7 +1351,7 @@ class DynamicTimelineUI(QWidget):
                 QMessageBox.No,
             )
             if reply == QMessageBox.No:
-                return
+                return False
 
         from .fgs_save import save_dynamic_fgs
 
@@ -842,6 +1374,121 @@ class DynamicTimelineUI(QWidget):
             self.original_events = copy.deepcopy(self.events)
             self.original_fps_text = self.fps_combo.currentText()
             self._update_ui_state()
+            return True
+        return False
+
+    def save_binary(self):
+        if not self.save_fgs():
+            return
+
+        if self.is_dirty():
+            return
+
+        import os
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+        fps = self._current_fps()
+        if fps <= 0:
+            fps = 24.0
+
+        # --- Static / Dynamic choice ---
+        from PySide6.QtWidgets import (
+            QDialog,
+            QVBoxLayout,
+            QHBoxLayout,
+            QLabel,
+            QPushButton,
+        )
+        from PySide6.QtCore import Qt
+
+        mode_dialog = QDialog(self)
+        mode_dialog.setWindowTitle("Binary Export Mode")
+        mode_dialog.setMinimumWidth(420)
+        _md_layout = QVBoxLayout(mode_dialog)
+        _md_layout.setSpacing(12)
+
+        _md_title = QLabel("<b>Choose the binary export mode:</b>")
+        _md_title.setTextFormat(Qt.RichText)
+        _md_layout.addWidget(_md_title)
+
+        _md_static_desc = QLabel(
+            "<b>Static</b> — Every event uses its own constant seed.\n"
+            "Grain pattern repeats identically on every frame within each event."
+        )
+        _md_static_desc.setWordWrap(True)
+        _md_layout.addWidget(_md_static_desc)
+
+        _md_dynamic_desc = QLabel(
+            "<b>Dynamic</b> — A different seed is chosen for each frame\n"
+            "from the curated seed list (current behaviour)."
+        )
+        _md_dynamic_desc.setWordWrap(True)
+        _md_layout.addWidget(_md_dynamic_desc)
+
+        _md_btn_layout = QHBoxLayout()
+        _md_static_btn = QPushButton("Static")
+        _md_dynamic_btn = QPushButton("Dynamic")
+        _md_cancel_btn = QPushButton("Cancel")
+        _md_btn_layout.addWidget(_md_static_btn)
+        _md_btn_layout.addWidget(_md_dynamic_btn)
+        _md_btn_layout.addWidget(_md_cancel_btn)
+        _md_layout.addLayout(_md_btn_layout)
+
+        _md_result = [None]
+
+        def _pick_static():
+            _md_result[0] = True
+            mode_dialog.accept()
+
+        def _pick_dynamic():
+            _md_result[0] = False
+            mode_dialog.accept()
+
+        _md_static_btn.clicked.connect(_pick_static)
+        _md_dynamic_btn.clicked.connect(_pick_dynamic)
+        _md_cancel_btn.clicked.connect(mode_dialog.reject)
+
+        if mode_dialog.exec() != QDialog.Accepted or _md_result[0] is None:
+            return
+
+        static_mode = _md_result[0]
+        # --- end Static / Dynamic choice ---
+
+        default_out = os.path.splitext(self.filepath)[0] + ".bin"
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save AFGS1 Binary Payload",
+            default_out,
+            "Binary AFGS1 (*.bin)",
+        )
+        if not output_path:
+            return
+
+        from .binary_x265_FGS import parse_and_pack
+
+        try:
+            success = parse_and_pack(
+                self.filepath,
+                output_path,
+                fps=fps,
+                fallback_frames=150000,
+                static_mode=static_mode,
+            )
+            if success:
+                mode_label = "Static" if static_mode else "Dynamic"
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    f"AFGS1 binary payload saved successfully ({mode_label} mode):\n{output_path}",
+                )
+            else:
+                QMessageBox.critical(self, "Error", "Failed to parse FGS txt file.")
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"An error occurred while generating binary payload:\n{str(e)}",
+            )
 
     def save_plot_as_png(self):
         save_path, _ = QFileDialog.getSaveFileName(
@@ -903,8 +1550,23 @@ class DynamicTimelineUI(QWidget):
                 self._pan_active = True
                 self._pan_start_x = event.x
                 self._pan_xlim_start = self.ax.get_xlim()
+            elif event.button == 1:  # Left click selection
+                self._select_active = True
+                self._select_start_x = event.xdata
+                if self._select_overlay:
+                    self._select_overlay.remove()
+                    self._select_overlay = None
+                self.canvas.draw_idle()
 
     def _on_mouse_move(self, event):
+        if self._select_active and event.inaxes == self.ax and event.xdata is not None:
+            if self._select_overlay:
+                self._select_overlay.remove()
+            self._select_overlay = self.ax.axvspan(
+                self._select_start_x, event.xdata, color="#4da6ff", alpha=0.3, zorder=10
+            )
+            self.canvas.draw_idle()
+
         if self._pan_active and event.inaxes == self.ax and self._xlim_full is not None:
             dx_pixels = event.x - self._pan_start_x
             cur_xmin, cur_xmax = self._pan_xlim_start
@@ -934,9 +1596,38 @@ class DynamicTimelineUI(QWidget):
     def _on_mouse_release(self, event):
         if event.button == 3:
             self._pan_active = False
+        elif event.button == 1 and self._select_active:
+            self._select_active = False
+            if self._select_start_x is not None and event.xdata is not None:
+                xmin = min(self._select_start_x, event.xdata)
+                xmax = max(self._select_start_x, event.xdata)
+
+                # Minimum drag distance to consider it a selection
+                if xmax - xmin > 0.001:
+                    selected = []
+                    for i, (t_s, t_e) in enumerate(
+                        zip(self._ev_t_start, self._ev_t_end)
+                    ):
+                        mid_t = (t_s + t_e) / 2
+                        if xmin <= mid_t <= xmax:
+                            selected.append(i)
+
+                    if len(selected) > 1:
+                        self._show_bulk_delete_menu(selected)
+                    else:
+                        if self._select_overlay:
+                            self._select_overlay.remove()
+                            self._select_overlay = None
+                        self.canvas.draw_idle()
+                else:
+                    if self._select_overlay:
+                        self._select_overlay.remove()
+                        self._select_overlay = None
+                    self.canvas.draw_idle()
 
     def _on_mouse_leave(self, event):
         self._pan_active = False
+        self._select_active = False
 
     def reset_zoom(self):
         if self._xlim_full is not None:
@@ -944,6 +1635,154 @@ class DynamicTimelineUI(QWidget):
             self.ax.set_xlim(*self._xlim_full)
             self._update_labels()
             self.canvas.draw_idle()
+
+    def _show_bulk_delete_menu(self, selected_indices):
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        del_menu = menu.addMenu(f"Bulk Delete ({len(selected_indices)} events)")
+        action_del_simple = del_menu.addAction("Delete only")
+        action_del_align = del_menu.addAction("Delete and align with neighbours")
+        action_del_interp = del_menu.addAction("Delete and interpolate with neighbours")
+
+        first_idx = min(selected_indices)
+        last_idx = max(selected_indices)
+
+        if first_idx == 0 or last_idx == len(self.events) - 1:
+            action_del_interp.setEnabled(False)
+
+        action = menu.exec(QCursor.pos())
+
+        if self._select_overlay:
+            self._select_overlay.remove()
+            self._select_overlay = None
+        self.canvas.draw_idle()
+
+        if action == action_del_simple:
+            self._bulk_delete_simple(selected_indices)
+        elif action == action_del_align:
+            self._bulk_delete_align(selected_indices)
+        elif action == action_del_interp:
+            self._bulk_delete_interpolate(selected_indices)
+
+    def _bulk_delete_simple(self, indices):
+        self._push_undo()
+        for idx in sorted(indices, reverse=True):
+            self.events.pop(idx)
+        self.build_timeline()
+        self._update_ui_state()
+
+    def _bulk_delete_align(self, indices):
+        self._push_undo()
+        indices = sorted(indices)
+        first_idx = indices[0]
+        last_idx = indices[-1]
+
+        t_start = self.events[first_idx]["start_time"]
+        t_end = self.events[last_idx]["end_time"]
+
+        has_prev = first_idx > 0
+        has_next = last_idx < len(self.events) - 1
+
+        for idx in reversed(indices):
+            self.events.pop(idx)
+
+        if has_prev and has_next:
+            mid_t = (t_start + t_end) // 2
+            self.events[first_idx - 1]["end_time"] = mid_t
+            self.events[first_idx]["start_time"] = mid_t
+        elif has_prev:
+            self.events[first_idx - 1]["end_time"] = t_end
+        elif has_next:
+            self.events[first_idx]["start_time"] = t_start
+
+        self.build_timeline()
+        self._update_ui_state()
+
+    def _bulk_delete_interpolate(self, indices):
+        indices = sorted(indices)
+        first_idx = indices[0]
+        last_idx = indices[-1]
+
+        has_prev = first_idx > 0
+        has_next = last_idx < len(self.events) - 1
+        if not (has_prev and has_next):
+            return
+
+        self._push_undo()
+        ev_L = self.events[first_idx - 1]
+        ev_R = self.events[last_idx + 1]
+        target_start = self.events[first_idx]["start_time"]
+        target_end = self.events[last_idx]["end_time"]
+
+        import math
+        from . import fgs_parser
+        from .fgs_save import _build_p_line, _build_scale_line, _build_c_line
+
+        p_L = fgs_parser.get_p_params(ev_L)
+        p_R = fgs_parser.get_p_params(ev_R)
+        new_p = {}
+        for k in fgs_parser.P_DEFAULTS:
+            v_L = p_L.get(k, fgs_parser.P_DEFAULTS[k])
+            v_R = p_R.get(k, fgs_parser.P_DEFAULTS[k])
+            new_p[k] = math.ceil((v_L + v_R) / 2.0)
+
+        sd_L = fgs_parser.get_scale_data(ev_L)
+        sd_R = fgs_parser.get_scale_data(ev_R)
+        new_sd = {}
+        for ch in ("sY", "sCb", "sCr"):
+            x_L = sd_L.get(ch, {}).get("x", [])
+            y_L = sd_L.get(ch, {}).get("y", [])
+            x_R = sd_R.get(ch, {}).get("x", [])
+            y_R = sd_R.get(ch, {}).get("y", [])
+            ml = min(len(x_L), len(x_R))
+            new_x = [int(round((a + b) / 2.0)) for a, b in zip(x_L[:ml], x_R[:ml])]
+            new_y = [int(round((a + b) / 2.0)) for a, b in zip(y_L[:ml], y_R[:ml])]
+            new_sd[ch] = {"x": new_x, "y": new_y}
+
+        cy_L, cb_L, cr_L = fgs_parser.extract_ar_coeffs_from_raw_lines(
+            ev_L.get("raw_lines", [])
+        )
+        cy_R, cb_R, cr_R = fgs_parser.extract_ar_coeffs_from_raw_lines(
+            ev_R.get("raw_lines", [])
+        )
+
+        def avg_coeffs(c1, c2):
+            ml = min(len(c1), len(c2))
+            return [int(round((a + b) / 2.0)) for a, b in zip(c1[:ml], c2[:ml])]
+
+        new_cy = avg_coeffs(cy_L, cy_R)
+        new_cb = avg_coeffs(cb_L, cb_R)
+        new_cr = avg_coeffs(cr_L, cr_R)
+
+        lag = new_p.get("ar_coeff_lag", 3)
+        new_lines = []
+        new_lines.append(_build_p_line(new_p))
+        for ch in ("sY", "sCb", "sCr"):
+            new_lines.append(_build_scale_line(ch, new_sd[ch]))
+        new_lines.append(_build_c_line("cY", new_cy, lag))
+        new_lines.append(_build_c_line("cCb", new_cb, lag))
+        new_lines.append(_build_c_line("cCr", new_cr, lag))
+
+        ep = list(ev_L.get("extra_params", ["1", "7391", "1"]))
+
+        new_ev = {
+            "start_time": target_start,
+            "end_time": target_end,
+            "extra_params": ep,
+            "raw_lines": new_lines,
+            "scale_data": new_sd,
+            "p_params": new_p,
+        }
+
+        for idx in reversed(indices):
+            self.events.pop(idx)
+
+        self.events.insert(first_idx, new_ev)
+
+        self.build_timeline()
+        self._update_ui_state()
 
 
 def _row(label_text: str, widget: QWidget) -> QHBoxLayout:

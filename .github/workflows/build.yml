@@ -46,8 +46,8 @@ jobs:
             --windows-icon-from-ico=icon.ico ^
             --windows-company-name="PingWer" ^
             --windows-product-name="FGSEditor" ^
-            --windows-file-version="3.0.0.0" ^
-            --windows-product-version="3.0.0.0" ^
+            --windows-file-version="4.0.0.0" ^
+            --windows-product-version="4.0.0.0" ^
             --windows-file-description="Film Grain Strength Editor" ^
             --output-dir=dist fgseditor_qt/fgsview_loader.py ^
             --include-package=fgseditor_qt ^
@@ -64,6 +64,7 @@ jobs:
           Copy-Item -Path FGS_grain_size  -Destination release/FGSEditor/FGS_grain_size  -Recurse
           Copy-Item -Path Templates       -Destination release/FGSEditor/Templates        -Recurse
           Copy-Item -Path NOTICE.md       -Destination release/FGSEditor/NOTICE.md
+          Copy-Item -Path settings.json   -Destination release/FGSEditor/settings.json -ErrorAction SilentlyContinue
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -114,6 +115,7 @@ jobs:
           cp -r FGS_grain_size  release/FGSEditor/FGS_grain_size
           cp -r Templates       release/FGSEditor/Templates
           cp    NOTICE.md       release/FGSEditor/NOTICE.md
+          cp    settings.json   release/FGSEditor/settings.json || true
           chmod +x release/FGSEditor/FGSEditor
 
       - name: Upload artifact

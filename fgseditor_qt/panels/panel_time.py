@@ -34,6 +34,7 @@ from ..time_utils import (
 
 class PanelTime(QWidget):
     time_changed = Signal(object, object)
+    fps_or_mode_changed = Signal()
 
     def __init__(self, parent_sidebar=None) -> None:
         super().__init__()
@@ -88,6 +89,7 @@ class PanelTime(QWidget):
         # Stacked pages
         self._stack = QStackedWidget()
         grp.idClicked.connect(self._stack.setCurrentIndex)
+        grp.idClicked.connect(lambda: self.fps_or_mode_changed.emit())
 
         page_frames = QWidget()
         pf = QVBoxLayout(page_frames)
@@ -271,6 +273,7 @@ class PanelTime(QWidget):
             return
         self._sync_widgets_from_ticks()
         self._update_info()
+        self.fps_or_mode_changed.emit()
 
     def _on_all_duration_toggled(self, checked: bool) -> None:
         if self._suppress:
@@ -336,3 +339,30 @@ class PanelTime(QWidget):
         self._end_ticks = t
         self._sync_widgets_from_ticks()
         self._emit_change()
+
+    def get_state(self) -> dict:
+        return {
+            "fps": self._fps_combo.currentText(),
+            "mode": self._stack.currentIndex(),
+            "start_ticks": self._start_ticks,
+            "end_ticks": self._end_ticks,
+        }
+
+    def set_state(self, state: dict) -> None:
+        self._suppress = True
+        if "fps" in state:
+            self._fps_combo.setCurrentText(state["fps"])
+        if "mode" in state:
+            self._stack.setCurrentIndex(state["mode"])
+            if state["mode"] == 0:
+                self._rb_frames.setChecked(True)
+            elif state["mode"] == 1:
+                self._rb_seconds.setChecked(True)
+            elif state["mode"] == 2:
+                self._rb_timecode.setChecked(True)
+        if "start_ticks" in state and "end_ticks" in state:
+            self._start_ticks = state["start_ticks"]
+            self._end_ticks = state["end_ticks"]
+        self._sync_widgets_from_ticks()
+        self._suppress = False
+        self._update_info()
