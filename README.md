@@ -42,6 +42,9 @@ FGSEditor delegates low-level video processing and grain injection to external t
 | [**`ffmpeg`** / **`ffprobe`**](https://ffmpeg.org/) | **Required for Video** | Video metadata extraction (FPS, duration, resolution) and lossless stream remuxing (preserving audio, subtitles, chapters, and attachments during Save & Apply). |
 | [**`av-denoise`**](https://github.com/ChillFish8/av-denoise) | Optional | GPU-accelerated video denoiser |
 
+> [!NOTE]
+> Supported versions for each third-party tool are specified directly within the release notes of each version on the [GitHub Releases](../../releases) page.
+
 ### How FGSEditor Finds External Tools
 You can configure the paths to these tools in **Settings** (click the **⚙** gear button on the home screen or open *Settings → Preferences*).
 If no path is specified, FGSEditor automatically searches for them in:
