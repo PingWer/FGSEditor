@@ -6,11 +6,11 @@ _root = pathlib.Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
-from PySide6.QtGui import QPalette, QColor, QIcon  # noqa: E402
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QPalette, QColor, QIcon
+from PySide6.QtCore import Qt
 
-from fgseditor_qt.main_ui import MainUI  # noqa: E402
+from fgseditor_qt.ui.main_ui import MainUI
 
 
 def setup_dark_theme(app: QApplication):
@@ -51,13 +51,28 @@ def setup_dark_theme(app: QApplication):
             color: #dddddd;
         }
         QPushButton { 
-            font-size: 15px;
-            padding: 8px 16px; 
+            font-size: 13px;
+            padding: 6px 14px; 
             border-radius: 6px; 
             border: 1px solid #3d3d3d; 
             background-color: #2d2d2d;
             font-weight: bold;
             color: #ffffff;
+        }
+        QFrame#toolbar QPushButton {
+            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 4px;
+        }
+        QFrame#toolbar QComboBox {
+            font-size: 12px;
+            padding: 3px 8px;
+            border-radius: 4px;
+        }
+        QDialog QPushButton {
+            font-size: 12px;
+            padding: 5px 12px;
+            border-radius: 4px;
         }
         QPushButton#bigButton {
             font-size: 16px;
@@ -168,20 +183,15 @@ def main():
         import ctypes
 
         try:
-            myappid = "PingWer.fgseditor.4.0.0"
+            myappid = "PingWer.fgseditor.5.0.0"
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except Exception:
             pass
 
     app = QApplication(sys.argv)
 
-    if hasattr(sys, "_MEIPASS"):
-        icon_path = os.path.join(sys._MEIPASS, "icon.ico")
-    else:
-        icon_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "icon.ico"
-        )
-
+    from fgseditor_qt.core.app_paths import get_image_path
+    icon_path = get_image_path("icon.ico")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 

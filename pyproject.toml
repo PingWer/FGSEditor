@@ -1,7 +1,7 @@
 [project]
 name = "FGSEditor"
-version = "3.1.2"
-description = "Film Grain Strength Editor"
+version = "5.0.0"
+description = "Film Grain Table Editor"
 requires-python = ">=3.12"
 license = "AGPL-3.0"
 dependencies = [
@@ -13,5 +13,10 @@ dependencies = [
 [project.scripts]
 fgseditor = "fgseditor_qt.fgsview_loader:main"
 
-[tool.setuptools]
-packages = ["fgseditor_qt"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fgseditor_qt*"]
+
+[tool.pyright]
+typeCheckingMode = "off"
+exclude = ["typings"]

@@ -4,6 +4,14 @@
 /.venv
 /fgseditor_qt/__pycache__
 *.spec
+/fgseditor_qt/panels/__pycache__
 *.pyc
-setting.json
 /Templates/user
+/FGSEditor.egg-info
+/.vscode
+/FGSEditor.wiki
+/typings
+/backup
+/docs
+/tests
+/scratch

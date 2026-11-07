@@ -43,24 +43,25 @@ jobs:
         run: |
           python -m nuitka --standalone --windows-console-mode=disable ^
             --plugin-enable=pyside6 ^
-            --windows-icon-from-ico=icon.ico ^
+            --windows-icon-from-ico=images/icon.ico ^
             --windows-company-name="PingWer" ^
             --windows-product-name="FGSEditor" ^
-            --windows-file-version="4.0.0.0" ^
-            --windows-product-version="4.0.0.0" ^
+            --windows-file-version="5.0.0.0" ^
+            --windows-product-version="5.0.0.0" ^
             --windows-file-description="Film Grain Strength Editor" ^
             --output-dir=dist fgseditor_qt/fgsview_loader.py ^
             --include-package=fgseditor_qt ^
             --output-filename=FGSEditor.exe ^
             --assume-yes-for-downloads ^
             --include-windows-runtime-dlls=no ^
-            --include-data-files=icon.ico=icon.ico
+            --include-data-dir=images=images
 
       - name: Prepare artifact
         shell: pwsh
         run: |
           mkdir release
           Move-Item -Path dist/fgsview_loader.dist -Destination release/FGSEditor
+          Copy-Item -Path images          -Destination release/FGSEditor/images          -Recurse
           Copy-Item -Path FGS_grain_size  -Destination release/FGSEditor/FGS_grain_size  -Recurse
           Copy-Item -Path Templates       -Destination release/FGSEditor/Templates        -Recurse
           Copy-Item -Path NOTICE.md       -Destination release/FGSEditor/NOTICE.md
@@ -104,7 +105,14 @@ jobs:
         run: |
           PYTHONPATH=. pyinstaller --noconfirm --onefile --noconsole \
             --name "FGSEditor" \
-            --add-data "icon.ico:." \
+            --icon="images/icon.ico" \
+            --add-data "images:images" \
+            --hidden-import="fgseditor_qt.core" \
+            --hidden-import="fgseditor_qt.math" \
+            --hidden-import="fgseditor_qt.tools" \
+            --hidden-import="fgseditor_qt.ui" \
+            --hidden-import="fgseditor_qt.ui.panels" \
+            --hidden-import="fgseditor_qt.panels" \
             --paths "." \
             fgseditor_qt/fgsview_loader.py
 
@@ -112,6 +120,7 @@ jobs:
         run: |
           mkdir -p release/FGSEditor
           cp dist/FGSEditor release/FGSEditor/
+          cp -r images          release/FGSEditor/images
           cp -r FGS_grain_size  release/FGSEditor/FGS_grain_size
           cp -r Templates       release/FGSEditor/Templates
           cp    NOTICE.md       release/FGSEditor/NOTICE.md
