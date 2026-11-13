@@ -8,7 +8,7 @@ if str(_root) not in sys.path:
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QPalette, QColor, QIcon
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QLoggingCategory
 
 from fgseditor_qt.ui.main_ui import MainUI
 
@@ -178,17 +178,35 @@ def setup_dark_theme(app: QApplication):
 def main():
     import multiprocessing
     multiprocessing.freeze_support()
-    
+
+    if sys.platform.startswith("linux"):
+        # Suppress noisy upstream QtWayland textinput v3 disableSurface warning spam
+        current_rules = os.environ.get("QT_LOGGING_RULES", "")
+        wayland_rules = "qt.qpa.wayland.textinput.warning=false;qt.qpa.wayland.textinput=false;qt.qpa.wayland=false"
+        os.environ["QT_LOGGING_RULES"] = (
+            f"{current_rules};{wayland_rules}".strip(";")
+            if current_rules
+            else wayland_rules
+        )
+        os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
+
     if os.name == "nt":
         import ctypes
 
         try:
-            myappid = "PingWer.fgseditor.5.0.0"
+            myappid = "PingWer.fgseditor.5.1.1"
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except Exception:
             pass
 
     app = QApplication(sys.argv)
+
+    if sys.platform.startswith("linux"):
+        QLoggingCategory.setFilterRules(
+            "qt.qpa.wayland.textinput.warning=false\n"
+            "qt.qpa.wayland.textinput=false\n"
+            "qt.qpa.wayland.warning=false"
+        )
 
     from fgseditor_qt.core.app_paths import get_image_path
     icon_path = get_image_path("icon.ico")
