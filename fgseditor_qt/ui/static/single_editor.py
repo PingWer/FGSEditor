@@ -493,7 +493,8 @@ class SingleEventEditor(QWidget):
         p_params = self.sidebar.get_p_params()
         linked = bool(p_params.get("chroma_scaling_from_luma", 0))
 
-        self.plotter.set_chroma_linked(linked)
+        if hasattr(self.plotter, "set_chroma_linked"):
+            self.plotter.set_chroma_linked(linked)
 
         if linked:
             self.current_scale_data["sCb"] = {"x": [], "y": []}

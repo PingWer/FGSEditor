@@ -230,6 +230,15 @@ class InteractiveFGSPlotter(QWidget):
         self._full_range_mode = enabled
         self.refresh()
 
+    def set_chroma_linked(self, linked: bool) -> None:
+        new_val = bool(linked)
+        if self._is_chroma_linked != new_val:
+            self._is_chroma_linked = new_val
+            self.refresh()
+
+    def is_chroma_linked(self) -> bool:
+        return self._is_chroma_linked
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, "figure") and self.figure is not None:

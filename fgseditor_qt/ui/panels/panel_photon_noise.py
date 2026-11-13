@@ -150,12 +150,22 @@ class PanelPhotonNoise(QWidget):
         }
 
     def set_state(self, state: dict) -> None:
-        self._pn_width.setText(state.get("pn_width", "1920"))
-        self._pn_height.setText(state.get("pn_height", "1080"))
+        self._pn_width.setText(str(state.get("pn_width", "1920")))
+        self._pn_height.setText(str(state.get("pn_height", "1080")))
         self._pn_iso.setValue(state.get("pn_iso", 400))
         self._pn_tf.setCurrentText(state.get("pn_tf", "BT_709"))
         self._pn_range.setCurrentText(state.get("pn_range", "LIMITED"))
-        self._pn_format.setCurrentText(state.get("pn_format", "35mm"))
+        fmt_val = state.get("pn_format", "35mm")
+        fmt_idx = self._pn_format.findText(fmt_val)
+        if fmt_idx < 0:
+            for i in range(self._pn_format.count()):
+                if self._pn_format.itemText(i).lower() == fmt_val.lower():
+                    fmt_idx = i
+                    break
+        if fmt_idx >= 0:
+            self._pn_format.setCurrentIndex(fmt_idx)
+        else:
+            self._pn_format.setCurrentText(fmt_val)
         self._pn_enable_chk.setChecked(state.get("pn_enabled", False))
         self._pn_apply_chroma_chk.setChecked(state.get("pn_apply_chroma", False))
 
