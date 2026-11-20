@@ -115,7 +115,13 @@ def build_static_lines(
         if len(e_line_tokens) > 5:
             update_p = e_line_tokens[5]
 
+    if apply_g == "0":
+        update_p = "0"
+
     result.append(f"E {st} {et} {apply_g} {seed_v} {update_p}\n")
+
+    if update_p == "0" or apply_g == "0":
+        return result
 
     result.append(_build_p_line(p_params))
 
@@ -136,10 +142,18 @@ def build_dynamic_lines(
     events: list[dict],
 ) -> list[str]:
     lines: list[str] = ["filmgrn1\n"]
+    prev_end: int | None = None
+    have_active_model = False
 
     for ev in events:
-        st = ev.get("start_time", 0)
-        et = ev.get("end_time", st + 10000000)
+        st = max(0, int(ev.get("start_time", 0)))
+        et = int(ev.get("end_time", st + 10000000))
+        if prev_end is not None and st < prev_end:
+            st = prev_end
+        if et <= st:
+            et = st + 1
+        prev_end = et
+
         extra = list(ev.get("extra_params") or ["1", "7391", "1"])
 
         if len(extra) < 3:
@@ -148,7 +162,18 @@ def build_dynamic_lines(
         elif len(extra) > 3:
             extra = extra[:3]
 
+        if extra[0] == "0":
+            extra[2] = "0"
+        elif extra[2] == "0" and not have_active_model:
+            extra[2] = "1"
+
+        if extra[0] != "0" and extra[2] != "0":
+            have_active_model = True
+
         lines.append(f"E {st} {et} {' '.join(extra)}\n")
+
+        if extra[2] == "0" or extra[0] == "0":
+            continue
 
         scale_data = fgs_parser.get_scale_data(ev)
         p_params = fgs_parser.get_p_params(ev)

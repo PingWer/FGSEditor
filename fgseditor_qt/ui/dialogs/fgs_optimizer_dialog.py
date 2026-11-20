@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -85,10 +86,16 @@ class OptimizerWorker(QThread):
                 self.finished_data.emit(False, "No valid FGS events found in file.", None)
                 return
 
+            bit_depth = v_info.get("bit_depth", 8) if v_info else 8
+
             if len(events) == 1:
                 self.progress_updated.emit(40, "Optimizing single event static FGS & calculating safe envelope...")
                 orig_ev = events[0]
-                opt_ev = fgs_optimizer.optimize_static_fgs(orig_ev, is_full_range=self.is_full_range)
+                opt_ev = fgs_optimizer.optimize_static_fgs(
+                    orig_ev,
+                    is_full_range=self.is_full_range,
+                    bit_depth=bit_depth,
+                )
 
                 if v_info:
                     from fgseditor_qt.math import time_utils
@@ -135,11 +142,14 @@ class OptimizerWorker(QThread):
                     if not self._is_cancelled:
                         self.progress_updated.emit(pct, msg)
 
+                is_444 = bool(v_info.get("is_444", False)) if v_info else False
                 optimized_events = fgs_optimizer.optimize_dynamic_fgs(
                     events,
                     is_full_range=self.is_full_range,
                     ignore_chroma=self.ignore_chroma,
+                    is_444=is_444,
                     progress_cb=_prog_cb,
+                    bit_depth=bit_depth,
                 )
 
                 if self._is_cancelled:
@@ -166,17 +176,14 @@ class OptimizerWorker(QThread):
                                         ev["end_time"] = vid_ticks
                                 if trimmed[-1].get("end_time", 0) != vid_ticks:
                                     trimmed[-1]["end_time"] = vid_ticks
-                                for ev in trimmed:
-                                    params_str = " ".join(ev.get("extra_params", ["1", "7391", "1"]))
-                                    ev["e_line"] = f"E {ev['start_time']} {ev['end_time']} {params_str}\n"
                                 optimized_events = trimmed
                             elif optimized_events:
                                 ev = optimized_events[0]
                                 ev["start_time"] = 0
                                 ev["end_time"] = vid_ticks
-                                params_str = " ".join(ev.get("extra_params", ["1", "7391", "1"]))
-                                ev["e_line"] = f"E {ev['start_time']} {ev['end_time']} {params_str}\n"
                                 optimized_events = [ev]
+                            fgs_optimizer.ensure_valid_afgs1_chain(optimized_events)
+                            fgs_optimizer.update_scene_equivalence_flags(optimized_events)
                     except Exception:
                         pass
 
@@ -582,12 +589,21 @@ class FgsOptimizerDialog(QDialog):
             merged_count = ev.get("raw_events_count", 1)
             strength = ev.get("apparent_strength", 0.0)
             cut_status = ev.get("cut_status", "[• Similarity Merge]")
+            ag = fgs_parser.get_apply_grain(ev)
+            up = fgs_parser.get_update_parameters(ev)
 
             item_idx = QTableWidgetItem(f"Scene {row + 1}")
             item_tc = QTableWidgetItem(tc_str)
             item_frames = QTableWidgetItem(frames_str)
             item_merged = QTableWidgetItem(str(merged_count))
-            item_strength = QTableWidgetItem(f"{strength:.2f}")
+            if ag == 0:
+                item_strength = QTableWidgetItem("0.00 (OFF)")
+                item_strength.setForeground(QColor("#ff6666"))
+            elif up == 0:
+                item_strength = QTableWidgetItem(f"{strength:.2f} (Inherit)")
+                item_strength.setForeground(QColor("#38bdf8"))
+            else:
+                item_strength = QTableWidgetItem(f"{strength:.2f}")
             item_status = QTableWidgetItem(cut_status)
 
             for item in (item_idx, item_tc, item_frames, item_merged, item_strength, item_status):
@@ -608,7 +624,11 @@ class FgsOptimizerDialog(QDialog):
             act_item = QTableWidgetItem("")
             act_item.setFlags(Qt.NoItemFlags)
             self.scenes_table.setItem(row, 6, act_item)
-            if ev.get("is_equivalent_with_prev") and row > 0:
+            if (
+                row > 0
+                and ev.get("is_equivalent_with_prev")
+                and fgs_optimizer.are_scenes_merge_compatible(opt_events[row - 1], ev)
+            ):
                 unify_btn = QPushButton("Merge with Prev")
                 unify_btn.setStyleSheet(
                     "background-color: #3d5a80; color: white; padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: bold;"
@@ -629,10 +649,30 @@ class FgsOptimizerDialog(QDialog):
         raw_events = self._current_result["raw_events"]
         prev_ev = opt_events[row - 1]
         curr_ev = opt_events[row]
+        if not fgs_optimizer.are_scenes_merge_compatible(prev_ev, curr_ev):
+            return
 
         t_start = prev_ev["start_time"]
         t_end = curr_ev["end_time"]
-        raw_slice = fgs_optimizer.get_raw_events_in_range(raw_events, t_start, t_end) or [prev_ev, curr_ev]
+        eff_all, _, _ = fgs_optimizer.resolve_effective_events(raw_events)
+        raw_slice = []
+        eff_slice = []
+        for raw_ev, eff_ev in zip(raw_events, eff_all):
+            if raw_ev["start_time"] < t_end and raw_ev["end_time"] > t_start:
+                raw_slice.append(raw_ev)
+                eff_slice.append(eff_ev)
+        if not raw_slice:
+            raw_slice = [prev_ev, curr_ev]
+            eff_slice = [prev_ev, curr_ev]
+
+        inherited_master = None
+        for k in range(row - 2, -1, -1):
+            ag_k, up_k = fgs_optimizer._event_flags(opt_events[k])
+            if ag_k == 1 and up_k == 1:
+                inherited_master = opt_events[k]
+                break
+
+        v_info = self._current_result.get("video_info") or {}
         unified = fgs_optimizer.consolidate_raw_events(
             raw_slice,
             t_start,
@@ -640,12 +680,18 @@ class FgsOptimizerDialog(QDialog):
             is_full_range=self._current_result["is_full_range"],
             ignore_chroma=self._current_result["ignore_chroma"],
             skip_simulation=False,
+            is_444=bool(v_info.get("is_444", False)),
+            bit_depth=int(v_info.get("bit_depth", 8) or 8),
+            effective_events=eff_slice,
+            inherited_master=inherited_master,
         )
         unified["apparent_strength"] = fgs_optimizer.evaluate_apparent_grain_strength(unified)
         unified["cut_status"] = prev_ev.get("cut_status", "[• Similarity Merge]")
 
         opt_events[row - 1] = unified
         opt_events.pop(row)
+        fgs_optimizer.ensure_valid_afgs1_chain(opt_events)
+        fgs_optimizer.update_scene_equivalence_flags(opt_events)
 
         self._render_dynamic_results(self._current_result)
 

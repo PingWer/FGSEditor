@@ -24,10 +24,10 @@ from PySide6.QtWidgets import (
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.collections import LineCollection
-from matplotlib.ticker import FuncFormatter
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 from fgseditor_qt.core import fgs_parser
 from fgseditor_qt.math import fgs_math
-from fgseditor_qt.core.app_paths import get_base_dir, is_temp_filepath
+from fgseditor_qt.core.app_paths import get_base_dir, get_user_data_dir, is_temp_filepath
 from fgseditor_qt.ui.widgets.shortcuts import create_standard_menu
 from fgseditor_qt.math.time_utils import (
     COMMON_FPS,
@@ -51,47 +51,115 @@ from fgseditor_qt.core.settings_manager import (
     save_window_geometry,
 )
 
-_MAX_LABELS = 50
+_MAX_LABELS = 100
 
 
-def _get_event_hash(ev: dict) -> str:
-    import json
+class NonNegativeLocator(MaxNLocator):
 
-    ev_copy = {k: v for k, v in ev.items() if k not in ("start_time", "end_time")}
-    return json.dumps(ev_copy, sort_keys=True)
+    def tick_values(self, vmin, vmax):
+        clamped_vmin = max(0.0, vmin)
+        ticks = super().tick_values(clamped_vmin, vmax)
+        return [t for t in ticks if t >= -1e-9]
+
+
+def _get_event_hash(ev: dict) -> tuple:
+    p = ev.get("p_params", {})
+    sy = tuple(ev.get("scale_data", {}).get("sY", {}).get("y", ()))
+    rl = tuple(ev.get("raw_lines", ()))
+    extra = ev.get("extra_params", [])
+    apply_grain = extra[0] if extra else "1"
+    return (
+        apply_grain,
+        p.get("ar_coeff_lag"),
+        p.get("ar_coeff_shift"),
+        p.get("grain_scale_shift"),
+        p.get("scaling_shift"),
+        sy,
+        rl,
+    )
+
+
+def _get_timeline_max_workers() -> int:
+    """Return bounded worker count configured for timeline multiprocessing."""
+    num_cores = os.cpu_count() or 1
+    default_workers = max(1, num_cores // 2)
+    max_workers = get_setting("timeline_max_workers", default_workers)
+    return max(1, min(int(max_workers), num_cores * 2))
+
+
+def _mp_clipping_worker_task(task_args: tuple) -> tuple:
+    """Top-level picklable worker computing AR grain extremes for a unique template."""
+    (
+        ext_key,
+        seed,
+        cy_tuple,
+        cb_tuple,
+        cr_tuple,
+        ar_lag,
+        ar_shift,
+        gs_shift,
+        is_444,
+        needed_channels,
+    ) = task_args
+    from fgseditor_qt.math.fgs_grain_sim import compute_grain_extremes
+
+    extremes = compute_grain_extremes(
+        seed=seed,
+        cy_coeffs=list(cy_tuple),
+        cb_coeffs=list(cb_tuple),
+        cr_coeffs=list(cr_tuple),
+        ar_lag=ar_lag,
+        ar_shift=ar_shift,
+        grain_scale_shift=gs_shift,
+        is_444=is_444,
+        channels=needed_channels,
+    )
+    return ext_key, extremes
+
+
+def _mp_worker_task(task_args: tuple) -> tuple:
+
+    task_key, cy_tuple, ar_lag, ar_shift, gs_shift, sY_avg, scaling_shift = task_args
+    from fgseditor_qt.math.fgs_grain_sim import compute_amplitude_at_point, get_luma_max_cached
+
+    try:
+        lmax = get_luma_max_cached(cy_tuple, ar_lag, ar_shift, gs_shift)
+    except Exception:
+        lmax = 0
+    st = compute_amplitude_at_point(lmax, sY_avg, scaling_shift)
+    return task_key, st
 
 
 def _process_timeline_event(args):
     i, key, ev = args
     from fgseditor_qt.core import fgs_parser
-    from fgseditor_qt.math.fgs_grain_sim import compute_amplitude_at_point, compute_grain_extremes_cached
+    from fgseditor_qt.math.fgs_grain_sim import compute_amplitude_at_point, get_luma_max_cached
+
+    if fgs_parser.get_apply_grain(ev) == 0:
+        return i, key, 0.0
+
+    scale_data = fgs_parser.get_scale_data(ev)
+    sy_data = scale_data.get("sY", {})
+    if not sy_data or not sy_data.get("y"):
+        return i, key, 0.0
 
     evt_ctx = {"p_params": ev.get("p_params", fgs_parser.P_DEFAULTS)}
     ar_shift = fgs_parser.get_ar_coeff_shift(evt_ctx)
     ar_lag = fgs_parser.get_ar_coeff_lag(evt_ctx)
     scaling_shift = fgs_parser.get_scaling_shift(evt_ctx)
     gs_shift = fgs_parser.get_grain_scale_shift(evt_ctx)
-    seed = fgs_parser.get_grain_seed(ev)
 
     cy_coeffs, _, _ = fgs_parser.extract_ar_coeffs_from_raw_lines(
         ev.get("raw_lines", [])
     )
 
     try:
-        extremes = compute_grain_extremes_cached(
-            seed, tuple(cy_coeffs), (), (), ar_lag, ar_shift, gs_shift
-        )
-        lmax = extremes["luma_max"]
+        lmax = get_luma_max_cached(tuple(cy_coeffs), ar_lag, ar_shift, gs_shift)
     except Exception:
         lmax = 0
 
-    scale_data = fgs_parser.get_scale_data(ev)
-    sy_data = scale_data.get("sY", {})
-    if not sy_data or not sy_data.get("y"):
-        strength = 0.0
-    else:
-        sY_avg = sum(sy_data["y"]) / len(sy_data["y"])
-        strength = compute_amplitude_at_point(lmax, sY_avg, scaling_shift)
+    sY_avg = sum(sy_data["y"]) / len(sy_data["y"])
+    strength = compute_amplitude_at_point(lmax, sY_avg, scaling_shift)
 
     return i, key, strength
 
@@ -102,9 +170,7 @@ class TimelineDataWorker(QThread):
 
     def __init__(self, missing_events):
         super().__init__()
-        import copy
-
-        self.missing_events = copy.deepcopy(missing_events)
+        self.missing_events = missing_events
         self._is_cancelled = False
         self._executor = None
 
@@ -117,55 +183,363 @@ class TimelineDataWorker(QThread):
                 pass
 
     def run(self):
-        import concurrent.futures
-        import os
-
         if not self.missing_events or self._is_cancelled:
             if not self._is_cancelled:
                 self.progress.emit(100)
                 self.finished_data.emit([])
             return
 
+        import os
+        import concurrent.futures
+        from fgseditor_qt.core import fgs_parser
+        from fgseditor_qt.core.settings_manager import get_setting
 
-        num_cores = os.cpu_count() or 1
-        max_workers = get_setting("timeline_max_workers", num_cores)
-        max_workers = max(1, min(max_workers, num_cores * 2))
+        self.progress.emit(5)
 
-        chunksize = max(1, len(self.missing_events) // (max_workers * 4))
+        unique_tasks = {}
+        event_dispatch = []
 
-        results = []
-        total = len(self.missing_events)
-
-        self._executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=max_workers
-        )
-        try:
-            for i, result in enumerate(
-                self._executor.map(
-                    _process_timeline_event,
-                    self.missing_events,
-                    chunksize=chunksize,
-                )
-            ):
-                if self._is_cancelled:
-                    return
-                results.append(result)
-                if i % max(1, total // 100) == 0 or i == total - 1:
-                    self.progress.emit(int((i + 1) / total * 100))
-        except Exception:
+        for i, key, ev in self.missing_events:
             if self._is_cancelled:
                 return
-            raise
-        finally:
-            if self._executor is not None:
+
+            if fgs_parser.get_apply_grain(ev) == 0:
+                event_dispatch.append((i, key, 0.0))
+                continue
+
+            scale_data = fgs_parser.get_scale_data(ev)
+            sy_data = scale_data.get("sY", {})
+            if not sy_data or not sy_data.get("y"):
+                event_dispatch.append((i, key, 0.0))
+                continue
+
+            evt_ctx = {"p_params": ev.get("p_params", fgs_parser.P_DEFAULTS)}
+            ar_shift = fgs_parser.get_ar_coeff_shift(evt_ctx)
+            ar_lag = fgs_parser.get_ar_coeff_lag(evt_ctx)
+            scaling_shift = fgs_parser.get_scaling_shift(evt_ctx)
+            gs_shift = fgs_parser.get_grain_scale_shift(evt_ctx)
+
+            cy_coeffs, _, _ = fgs_parser.extract_ar_coeffs_from_raw_lines(
+                ev.get("raw_lines", [])
+            )
+            cy_tuple = tuple(cy_coeffs)
+            sY_avg = sum(sy_data["y"]) / len(sy_data["y"])
+
+            task_key = (cy_tuple, ar_lag, ar_shift, gs_shift, sY_avg, scaling_shift)
+            event_dispatch.append((i, key, task_key))
+
+            if task_key not in unique_tasks:
+                unique_tasks[task_key] = (task_key, cy_tuple, ar_lag, ar_shift, gs_shift, sY_avg, scaling_shift)
+
+        self.progress.emit(10)
+
+        max_workers = _get_timeline_max_workers()
+
+        tasks_list = list(unique_tasks.values())
+        solved_cache = {}
+        total_tasks = len(tasks_list)
+
+        use_multiprocessing = total_tasks > 16 and max_workers > 1
+        computed_successfully = False
+
+        if use_multiprocessing and not self._is_cancelled:
+            chunksize = max(8, total_tasks // (max_workers * 4))
+            try:
+                import multiprocessing
+
+                mp_ctx = multiprocessing.get_context("spawn")
+                self._executor = concurrent.futures.ProcessPoolExecutor(
+                    max_workers=max_workers, mp_context=mp_ctx
+                )
+                for done_idx, (t_key, st) in enumerate(
+                    self._executor.map(_mp_worker_task, tasks_list, chunksize=chunksize)
+                ):
+                    if self._is_cancelled:
+                        return
+                    solved_cache[t_key] = st
+                    if done_idx % max(1, total_tasks // 80) == 0:
+                        prog = 10 + int((done_idx + 1) / total_tasks * 85)
+                        self.progress.emit(min(95, prog))
+                computed_successfully = True
+            except Exception:
+                computed_successfully = False
+            finally:
+                if self._executor is not None:
+                    try:
+                        self._executor.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
+                    self._executor = None
+
+        if not computed_successfully and not self._is_cancelled:
+            for done_idx, task_args in enumerate(tasks_list):
+                if self._is_cancelled:
+                    return
+                t_key, st = _mp_worker_task(task_args)
+                solved_cache[t_key] = st
+                if done_idx % max(1, total_tasks // 80) == 0:
+                    prog = 10 + int((done_idx + 1) / total_tasks * 85)
+                    self.progress.emit(min(95, prog))
+
+        if self._is_cancelled:
+            return
+
+        results = []
+        for i, original_key, target in event_dispatch:
+            if isinstance(target, (int, float)):
+                results.append((i, original_key, target))
+            else:
+                results.append((i, original_key, solved_cache.get(target, 0.0)))
+
+        self.progress.emit(100)
+        self.finished_data.emit(results)
+
+
+def _clone_events(events: list[dict]) -> list[dict]:
+
+    return [
+        {
+            k: (
+                {
+                    dk: (
+                        {ik: (list(iv) if isinstance(iv, list) else iv) for ik, iv in dv.items()}
+                        if isinstance(dv, dict)
+                        else (list(dv) if isinstance(dv, list) else dv)
+                    )
+                    for dk, dv in v.items()
+                }
+                if isinstance(v, dict)
+                else (list(v) if isinstance(v, list) else v)
+            )
+            for k, v in ev.items()
+        }
+        for ev in events
+    ]
+
+
+class FixClippingWorker(QThread):
+    """Background worker fixing AR grain clipping across all timeline events."""
+
+    progress = Signal(int)
+    finished_fix = Signal(object)
+    cancelled = Signal()
+    error_occurred = Signal(str)
+
+    def __init__(
+        self,
+        events: list[dict],
+        bit_depth: int,
+        v_info: dict,
+        is_444: bool,
+        fix_endpoints: bool = True,
+    ):
+        super().__init__()
+        self.events = events
+        self.bit_depth = bit_depth
+        self.v_info = v_info
+        self.is_444 = bool(is_444)
+        self.fix_endpoints = bool(fix_endpoints)
+        self._is_cancelled = False
+        self._executor = None
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+    def run(self) -> None:
+        try:
+            from fgseditor_qt.core import fgs_parser
+            from fgseditor_qt.math.fgs_grain_sim import (
+                event_potentially_clipping_channels,
+                fix_event_clipping,
+                is_event_full_range,
+            )
+
+            total_events = len(self.events)
+            if total_events == 0:
+                self.progress.emit(100)
+                self.finished_fix.emit((self.events, 0, 0))
+                return
+
+            last_pct = 0
+            self.progress.emit(0)
+
+            event_ext_keys: list[tuple | None] = [None] * total_events
+            event_full_flags: list[bool] = [False] * total_events
+            unique_specs: dict[tuple, tuple] = {}
+            unique_channel_sets: dict[tuple, set[str]] = {}
+
+            for idx, ev in enumerate(self.events):
+                if self._is_cancelled:
+                    self.cancelled.emit()
+                    return
+
+                is_full = is_event_full_range(ev, self.v_info)
+                needed_channels = event_potentially_clipping_channels(
+                    ev,
+                    bit_depth=self.bit_depth,
+                    is_full_range=is_full,
+                    channels=("sY", "sCb", "sCr"),
+                    fix_endpoints=self.fix_endpoints,
+                )
+                if not needed_channels:
+                    continue
+
+                p_params = fgs_parser.get_p_params(ev)
+                lag = p_params.get("ar_coeff_lag", 3)
+                ar_shift = p_params.get("ar_coeff_shift", 6)
+                gs_shift = p_params.get("grain_scale_shift", 0)
+                seed = fgs_parser.get_grain_seed(ev)
+                cy, cb, cr = fgs_parser.extract_ar_coeffs_from_raw_lines(ev.get("raw_lines", []))
+
+                cy_t = tuple(cy)
+                cb_t = tuple(cb)
+                cr_t = tuple(cr)
+                ext_key = (seed, cy_t, cb_t, cr_t, lag, ar_shift, gs_shift, self.is_444)
+                event_ext_keys[idx] = ext_key
+                event_full_flags[idx] = is_full
+                if ext_key not in unique_specs:
+                    unique_specs[ext_key] = (
+                        ext_key,
+                        seed,
+                        cy_t,
+                        cb_t,
+                        cr_t,
+                        lag,
+                        ar_shift,
+                        gs_shift,
+                        self.is_444,
+                    )
+                    unique_channel_sets[ext_key] = set(needed_channels)
+                else:
+                    unique_channel_sets[ext_key].update(needed_channels)
+
+                if (idx & 1023) == 1023:
+                    pct = int(5 * (idx + 1) / total_events)
+                    if pct > last_pct:
+                        last_pct = pct
+                        self.progress.emit(pct)
+
+            if not unique_specs:
+                self.progress.emit(100)
+                self.finished_fix.emit((self.events, 0, 0))
+                return
+
+            self.progress.emit(5)
+            last_pct = 5
+
+            max_workers = _get_timeline_max_workers()
+            tasks_list = [
+                spec + (tuple(c for c in ("sY", "sCb", "sCr") if c in unique_channel_sets[ext_key]),)
+                for ext_key, spec in unique_specs.items()
+            ]
+            total_tasks = len(tasks_list)
+            solved_cache: dict[tuple, dict[str, int]] = {}
+            completed_tasks = 0
+
+            def _emit_phase2_progress(done_count: int) -> None:
+                nonlocal last_pct
+                pct = 5 + int(80 * done_count / total_tasks)
+                if pct > last_pct:
+                    last_pct = pct
+                    self.progress.emit(pct)
+
+            use_multiprocessing = total_tasks > 16 and max_workers > 1
+            if use_multiprocessing and not self._is_cancelled:
+                chunksize = max(1, min(16, total_tasks // (max_workers * 4)))
                 try:
-                    self._executor.shutdown(wait=False, cancel_futures=True)
+                    import multiprocessing
+
+                    mp_ctx = multiprocessing.get_context("spawn")
+                    self._executor = concurrent.futures.ProcessPoolExecutor(
+                        max_workers=max_workers, mp_context=mp_ctx
+                    )
+                    for ext_key, extremes in self._executor.map(
+                        _mp_clipping_worker_task,
+                        tasks_list,
+                        chunksize=chunksize,
+                    ):
+                        if self._is_cancelled:
+                            break
+                        solved_cache[ext_key] = extremes
+                        completed_tasks += 1
+                        _emit_phase2_progress(completed_tasks)
                 except Exception:
                     pass
-                self._executor = None
+                finally:
+                    executor = self._executor
+                    self._executor = None
+                    if executor is not None:
+                        try:
+                            executor.shutdown(
+                                wait=not self._is_cancelled,
+                                cancel_futures=self._is_cancelled,
+                            )
+                        except Exception:
+                            pass
 
-        if not self._is_cancelled:
-            self.finished_data.emit(results)
+            if self._is_cancelled:
+                self.cancelled.emit()
+                return
+
+            if len(solved_cache) < total_tasks:
+                for task_args in tasks_list:
+                    if self._is_cancelled:
+                        self.cancelled.emit()
+                        return
+                    ext_key = task_args[0]
+                    if ext_key in solved_cache:
+                        continue
+                    _, extremes = _mp_clipping_worker_task(task_args)
+                    solved_cache[ext_key] = extremes
+                    completed_tasks += 1
+                    _emit_phase2_progress(completed_tasks)
+
+            modified_count = 0
+            max_shift_overall = 0
+
+            candidate_indices = [idx for idx, ext_key in enumerate(event_ext_keys) if ext_key is not None]
+            total_candidates = len(candidate_indices)
+            for c_idx, ev_idx in enumerate(candidate_indices):
+                if self._is_cancelled:
+                    self.cancelled.emit()
+                    return
+                ext_key = event_ext_keys[ev_idx]
+                changed, max_shift = fix_event_clipping(
+                    self.events[ev_idx],
+                    bit_depth=self.bit_depth,
+                    is_full_range=event_full_flags[ev_idx],
+                    channels=("sY", "sCb", "sCr"),
+                    is_444=self.is_444,
+                    extremes=solved_cache.get(ext_key),
+                    fix_endpoints=self.fix_endpoints,
+                )
+                if changed:
+                    modified_count += 1
+                    if max_shift > max_shift_overall:
+                        max_shift_overall = max_shift
+
+                pct = 85 + int(15 * (c_idx + 1) / total_candidates)
+                if pct > last_pct:
+                    last_pct = pct
+                    self.progress.emit(pct)
+
+            if self._is_cancelled:
+                self.cancelled.emit()
+                return
+
+            self.progress.emit(100)
+            self.finished_fix.emit((self.events, modified_count, max_shift_overall))
+        except Exception as exc:
+            if self._is_cancelled:
+                self.cancelled.emit()
+            else:
+                self.error_occurred.emit(str(exc))
 
 
 class DynamicTimelineUI(QWidget):
@@ -180,7 +554,8 @@ class DynamicTimelineUI(QWidget):
         self.file_data = file_data
         self.events = file_data["events"]
         self._clamp_last_event_to_video_duration()
-        self.original_events = copy.deepcopy(self.events)
+        self._ensure_valid_master_chain()
+        self.original_events = _clone_events(self.events)
         self.filepath = file_data["filepath"]
         self.header_lines = file_data["header_lines"]
 
@@ -218,9 +593,13 @@ class DynamicTimelineUI(QWidget):
         self._ev_t_start: list[float] = []
         self._ev_t_end: list[float] = []
         self._ev_strength: list[float] = []
+        self._curve_line = None
         self._line_collection = None
         self._scatter_collection = None
+        self._visible_indices: list[int] = []
         self._timeline_worker = None
+        self._fix_clipping_worker = None
+        self._save_apply_enabled_state = False
 
         win_title = "Unsaved FGS" if self._is_temp else os.path.basename(self.filepath)
         self.setWindowTitle(f"Dynamic FGS Timeline - {win_title}")
@@ -315,6 +694,13 @@ class DynamicTimelineUI(QWidget):
         self.reset_zoom_btn.setToolTip("Fit timeline to view.")
         self.reset_zoom_btn.clicked.connect(self.reset_zoom)
         mid_layout.addWidget(self.reset_zoom_btn, stretch=0)
+
+        self.fix_clipping_btn = QPushButton("Fix clipping")
+        self.fix_clipping_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.fix_clipping_btn.setToolTip("Shift points across all events and channels to prevent clipping")
+        self.fix_clipping_btn.clicked.connect(self.fix_clipping_all_events)
+        self.fix_clipping_btn.setEnabled(False)
+        mid_layout.addWidget(self.fix_clipping_btn, stretch=0)
 
         self.save_plot_btn = QPushButton("Save Plot")
         self.save_plot_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -411,8 +797,13 @@ class DynamicTimelineUI(QWidget):
             "QProgressBar { border: 1px solid #444; border-radius: 5px; text-align: center; color: white; }"
             "QProgressBar::chunk { background-color: #4da6ff; width: 20px; }"
         )
+        self.progress_cancel_btn = QPushButton("Cancel")
+        self.progress_cancel_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.progress_cancel_btn.clicked.connect(self._cancel_fix_clipping)
+        self.progress_cancel_btn.hide()
         prog_layout.addWidget(self.progress_label)
         prog_layout.addWidget(self.progress_bar)
+        prog_layout.addWidget(self.progress_cancel_btn, alignment=Qt.AlignCenter)
         self.main_stack.addWidget(self.progress_container)
 
         self.build_timeline()
@@ -449,6 +840,9 @@ class DynamicTimelineUI(QWidget):
         all_errors = []
 
         for idx, ev in enumerate(self.events):
+            if fgs_parser.get_apply_grain(ev) == 0:
+                continue
+
             ar_shift = fgs_parser.get_ar_coeff_shift(ev)
 
             cy_coeffs, cb_coeffs, cr_coeffs = (
@@ -479,6 +873,32 @@ class DynamicTimelineUI(QWidget):
 
         return all_errors
 
+    def _is_clipping_busy(self) -> bool:
+        worker = getattr(self, "_fix_clipping_worker", None)
+        return worker is not None and worker.isRunning()
+
+    def _is_timeline_busy(self) -> bool:
+        worker = getattr(self, "_timeline_worker", None)
+        return worker is not None and worker.isRunning()
+
+    def _apply_toolbar_busy_state(self, fix_busy: bool, timeline_busy: bool) -> None:
+        can_save = bool(self.events) and not fix_busy
+        self.save_btn.setEnabled(can_save)
+        if hasattr(self, "save_bin_btn"):
+            self.save_bin_btn.setEnabled(can_save)
+        if hasattr(self, "save_apply_btn"):
+            self.save_apply_btn.setEnabled(
+                getattr(self, "_save_apply_enabled_state", False) and not fix_busy
+            )
+        if hasattr(self, "fix_clipping_btn"):
+            self.fix_clipping_btn.setEnabled(
+                bool(self.events) and not fix_busy and not timeline_busy
+            )
+        for ctrl_name in ("fps_combo", "time_format_combo", "reset_zoom_btn", "save_plot_btn"):
+            ctrl = getattr(self, ctrl_name, None)
+            if ctrl is not None:
+                ctrl.setEnabled(not fix_busy)
+
     def _update_ui_state(self):
         dirty = self.is_dirty()
 
@@ -490,7 +910,10 @@ class DynamicTimelineUI(QWidget):
         else:
             self.validation_warning_label.hide()
 
-        self.save_btn.setEnabled(bool(self.events))
+        self._apply_toolbar_busy_state(
+            fix_busy=self._is_clipping_busy(),
+            timeline_busy=self._is_timeline_busy(),
+        )
 
         fname = "Unsaved FGS" if (getattr(self, "_is_temp", False) or not self.filepath or is_temp_filepath(self.filepath)) else os.path.basename(self.filepath)
         title = f"Dynamic FGS Timeline - {fname}"
@@ -499,12 +922,16 @@ class DynamicTimelineUI(QWidget):
         self.setWindowTitle(title)
 
     def _on_fps_changed(self, text: str):
+        if self._is_clipping_busy():
+            return
         self._update_ui_state()
         if self.time_format_combo.currentText() == "Frames":
             self.build_timeline()
         self._update_inline_edit_bar_text()
 
     def _on_time_format_changed(self, text: str):
+        if self._is_clipping_busy():
+            return
         self.build_timeline()
         self._update_inline_edit_bar_text()
 
@@ -534,14 +961,22 @@ class DynamicTimelineUI(QWidget):
                 event.ignore()
                 return
 
-        if hasattr(self, "_timeline_worker") and self._timeline_worker is not None and self._timeline_worker.isRunning():
-            try:
-                self._timeline_worker.finished_data.disconnect()
-                self._timeline_worker.progress.disconnect()
-            except Exception:
-                pass
-            self._timeline_worker.cancel()
-            self._timeline_worker.wait(3000)
+        for worker_attr, signal_names in (
+            ("_timeline_worker", ("finished_data", "progress")),
+            ("_fix_clipping_worker", ("finished_fix", "cancelled", "error_occurred", "progress")),
+        ):
+            worker = getattr(self, worker_attr, None)
+            if worker is not None:
+                for sig_name in signal_names:
+                    sig = getattr(worker, sig_name, None)
+                    if sig is not None:
+                        try:
+                            sig.disconnect()
+                        except Exception:
+                            pass
+                if worker.isRunning():
+                    worker.cancel()
+                    worker.wait(3000)
 
         if self.figure:
             import matplotlib.pyplot as plt
@@ -554,6 +989,7 @@ class DynamicTimelineUI(QWidget):
         self.canvas = None
         self.ax = None
         self.lines = []
+        self._curve_line = None
         self._line_collection = None
         self._scatter_collection = None
         self._select_overlay = None
@@ -583,8 +1019,11 @@ class DynamicTimelineUI(QWidget):
         if not self.is_dirty() or not self.events:
             return
 
-        backup_dir = os.path.join(get_base_dir(), "backup")
-        os.makedirs(backup_dir, exist_ok=True)
+        backup_dir = os.path.join(get_user_data_dir(), "backup")
+        try:
+            os.makedirs(backup_dir, exist_ok=True)
+        except OSError:
+            return
 
         is_static = len(self.events) <= 1
 
@@ -609,22 +1048,22 @@ class DynamicTimelineUI(QWidget):
             pass
 
     def _push_undo(self):
-        self._undo_stack.append(copy.deepcopy(self.events))
+        self._undo_stack.append(_clone_events(self.events))
         self._redo_stack.clear()
         self._update_ui_state()
 
     def undo(self):
-        if not self._undo_stack:
+        if self._is_clipping_busy() or not self._undo_stack:
             return
-        self._redo_stack.append(copy.deepcopy(self.events))
+        self._redo_stack.append(_clone_events(self.events))
         self.events = self._undo_stack.pop()
         self.build_timeline()
         self._update_ui_state()
 
     def redo(self):
-        if not self._redo_stack:
+        if self._is_clipping_busy() or not self._redo_stack:
             return
-        self._undo_stack.append(copy.deepcopy(self.events))
+        self._undo_stack.append(_clone_events(self.events))
         self.events = self._redo_stack.pop()
         self.build_timeline()
         self._update_ui_state()
@@ -644,6 +1083,8 @@ class DynamicTimelineUI(QWidget):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
+        if self._is_clipping_busy():
+            return
         urls = event.mimeData().urls()
         if urls and urls[0].isLocalFile():
             filepath = urls[0].toLocalFile()
@@ -717,8 +1158,12 @@ class DynamicTimelineUI(QWidget):
     ]
 
     def build_timeline(self):
+        if self._is_clipping_busy():
+            return
         self._clamp_last_event_to_video_duration()
+        self._ensure_valid_master_chain()
         self.lines = []
+        self._curve_line = None
         self._line_collection = None
         self._scatter_collection = None
         self.ax.clear()
@@ -738,6 +1183,10 @@ class DynamicTimelineUI(QWidget):
                 missing_events.append((i, key, ev))
 
         if missing_events:
+            self.progress_label.setText("Calculating timeline data...")
+            self.progress_cancel_btn.hide()
+            if hasattr(self, "fix_clipping_btn"):
+                self.fix_clipping_btn.setEnabled(False)
             self.progress_bar.setValue(0)
             self.main_stack.setCurrentWidget(self.progress_container)
             from PySide6.QtWidgets import QApplication
@@ -761,7 +1210,11 @@ class DynamicTimelineUI(QWidget):
             self._on_timeline_data_ready([])
 
     def _on_timeline_data_ready(self, new_results):
+        if self.canvas is None or self.ax is None:
+            return
         self.main_stack.setCurrentWidget(self.canvas)
+        if hasattr(self, "fix_clipping_btn"):
+            self.fix_clipping_btn.setEnabled(bool(self.events) and not self._is_clipping_busy())
         if not hasattr(self, "_strength_cache"):
             self._strength_cache = {}
 
@@ -788,51 +1241,89 @@ class DynamicTimelineUI(QWidget):
         self._ev_t_end = t_ends.tolist()
         self._ev_strength = strengths.tolist()
         self._ev_mid_x = ((t_starts + t_ends) / 2.0).tolist()
-        self._label_artists: list = []
+        self._label_artists = []
+        self._visible_indices = []
 
         min_s = float(strengths.min()) if n > 0 else 0.0
         max_s = float(strengths.max()) if n > 0 else 0.0
         min_t = float(t_starts.min()) if n > 0 else 0.0
         max_t = float(t_ends.max()) if n > 0 else 0.0
-        margin_y = max(5, (max_s - min_s) * 0.3)
-        margin_x = max(1, (max_t - min_t) * 0.05)
-        self._margin_y = margin_y
 
-        segs = [
-            [(t_starts[i], strengths[i]), (t_ends[i], strengths[i])] for i in range(n)
-        ]
-        seg_colors = [colors_cycle[i % len(colors_cycle)] for i in range(n)]
+        t_span = max(1e-4, max_t - min_t)
+
+        offset_x = max(1e-4, t_span * 0.008)
+        full_xmin = -offset_x if min_t <= offset_x else (min_t - offset_x)
+        full_xmax = max_t + max(1e-4, t_span * 0.02)
+        self._xlim_full = (full_xmin, full_xmax)
+
+        margin_y_top = max(5.0, (max_s - min_s) * 0.3)
+        self._margin_y = margin_y_top
+
+        offset_y = max(0.1, max_s * 0.035)
+        ymin = -offset_y if min_s <= offset_y else max(0.0, min_s - offset_y)
+        ymax = max_s + margin_y_top * 1.2
+        self._ylim_bounds = (ymin, ymax)
+
+        # Precompute per-event segment colors
+        seg_colors = []
+        for i, ev in enumerate(self.events):
+            extra = ev.get("extra_params") or ["1", "7391", "1"]
+            try:
+                ag = int(extra[0]) if len(extra) > 0 else 1
+                up = int(extra[2]) if len(extra) > 2 else 1
+            except (ValueError, TypeError):
+                ag, up = 1, 1
+
+            if ag == 0:
+                seg_colors.append("#ff4444")
+            elif up == 0:
+                seg_colors.append("#38bdf8")
+            else:
+                seg_colors.append(colors_cycle[i % len(colors_cycle)])
         self._ev_colors = seg_colors
 
+        t_curve = np.empty(2 * n)
+        s_curve = np.empty(2 * n)
+        t_curve[0::2] = t_starts
+        t_curve[1::2] = t_ends
+        s_curve[0::2] = strengths
+        s_curve[1::2] = strengths
+        (self._curve_line,) = self.ax.plot(
+            t_curve,
+            s_curve,
+            color="#38bdf8",
+            linewidth=1.5,
+            zorder=2,
+            clip_on=True,
+            visible=False,
+        )
+
         lc = LineCollection(
-            segs,
-            colors=seg_colors,
+            [],
             linewidths=4,
-            capstyle="round",
+            capstyle="butt",
             picker=12,
             clip_on=True,
+            zorder=2,
         )
         self.ax.add_collection(lc)
         self._line_collection = lc
 
-        mid_x = np.array(self._ev_mid_x)
         sc = self.ax.scatter(
-            mid_x,
-            strengths,
-            c=seg_colors,
-            s=80,
+            [],
+            [],
+            s=70,
             zorder=3,
             clip_on=True,
             picker=12,
             edgecolors="white",
             linewidths=1,
             alpha=0.9,
+            visible=False,
         )
         self._scatter_collection = sc
 
-        self._label_artists = []
-
-        self.ax.set_title("Timeline Overview (Click segment to edit)", color="white")
+        self.ax.set_title("Timeline Overview (Click to select, double-click event to edit)", color="white")
 
         time_format = self.time_format_combo.currentText()
         fps = fps_from_label(self.fps_combo.currentText())
@@ -841,7 +1332,9 @@ class DynamicTimelineUI(QWidget):
             self.ax.set_xlabel("Time (frames)", color="#cccccc")
 
             def frame_formatter(x, pos):
-                frames = int(round(x * fps))
+                if x < -1e-6:
+                    return ""
+                frames = ticks_to_frames(seconds_to_ticks(x), fps)
                 return str(frames)
 
             self.ax.xaxis.set_major_formatter(FuncFormatter(frame_formatter))
@@ -849,84 +1342,258 @@ class DynamicTimelineUI(QWidget):
             self.ax.set_xlabel("Time (HH:MM:SS:mmm)", color="#cccccc")
 
             def timecode_formatter(x, pos):
+                if x < -1e-6:
+                    return ""
                 ticks = seconds_to_ticks(x)
                 return ticks_to_timecode(ticks)
 
             self.ax.xaxis.set_major_formatter(FuncFormatter(timecode_formatter))
         else:
             self.ax.set_xlabel("Time (seconds)", color="#cccccc")
-            self.ax.xaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{x:.2f}"))
+
+            def sec_formatter(x, pos):
+                if x < -1e-6:
+                    return ""
+                return f"{x:.2f}"
+
+            self.ax.xaxis.set_major_formatter(FuncFormatter(sec_formatter))
+
+        self.ax.xaxis.set_major_locator(NonNegativeLocator(nbins=8))
 
         self.ax.set_ylabel("Effective Amplitude (px \u00b1)", color="#cccccc")
         self.ax.tick_params(colors="white")
 
-        self._xlim_full = (min_t - margin_x, max_t + margin_x)
+        self.ax.yaxis.set_major_locator(NonNegativeLocator(nbins=6, integer=True))
+
+        def amplitude_formatter(y, pos):
+            if y < -1e-6:
+                return ""
+            return f"{int(round(y))}"
+
+        self.ax.yaxis.set_major_formatter(FuncFormatter(amplitude_formatter))
+
         if self._zoom_xlim:
             self.ax.set_xlim(*self._zoom_xlim)
         else:
             self.ax.set_xlim(*self._xlim_full)
 
-        self.ax.set_ylim(max(0, min_s - margin_y), max_s + margin_y * 1.5)
+        self.ax.set_ylim(*self._ylim_bounds)
         self.ax.grid(True, linestyle="--", color="#444444", alpha=0.3)
 
         self.figure.tight_layout()
-        self._update_labels()
+        self._update_view()
         self.canvas.draw_idle()
 
-    def _update_labels(self):
-        for artist in self._label_artists:
+    def _find_event_at_x(self, xdata: float) -> int | None:
+        if xdata is None or not getattr(self, "_ev_t_start", None):
+            return None
+        import bisect
+        n_ev = len(self._ev_t_start)
+        pos = bisect.bisect_right(self._ev_t_start, xdata) - 1
+        if 0 <= pos < n_ev:
+            is_last_or_gap = (pos == n_ev - 1) or (self._ev_t_end[pos] < self._ev_t_start[pos + 1])
+            if is_last_or_gap:
+                if self._ev_t_start[pos] <= xdata <= self._ev_t_end[pos]:
+                    return pos
+            else:
+                if self._ev_t_start[pos] <= xdata < self._ev_t_end[pos]:
+                    return pos
+        if 0 <= pos + 1 < n_ev:
+            if self._ev_t_start[pos + 1] <= xdata <= self._ev_t_end[pos + 1]:
+                return pos + 1
+        candidates = [p for p in (pos, pos + 1) if 0 <= p < len(self._ev_t_start)]
+        if candidates and hasattr(self, "ax") and self.ax is not None:
+            best_p = min(
+                candidates,
+                key=lambda p: min(
+                    abs(xdata - self._ev_t_start[p]),
+                    abs(xdata - self._ev_t_end[p]),
+                ),
+            )
+            bbox = self.ax.get_window_extent()
+            cur_xlim = self.ax.get_xlim()
+            cur_range = cur_xlim[1] - cur_xlim[0]
+            if cur_range > 0 and bbox.width > 0:
+                dt = min(
+                    abs(xdata - self._ev_t_start[best_p]),
+                    abs(xdata - self._ev_t_end[best_p]),
+                )
+                px_dist = dt * (bbox.width / cur_range)
+                if px_dist < 15:
+                    return best_p
+        return None
+
+    def _clear_labels(self):
+        for artist in getattr(self, "_label_artists", []):
             try:
                 artist.remove()
             except Exception:
                 pass
         self._label_artists = []
 
-        if not self._ev_t_start:
-            return
-
-        xmin, xmax = self.ax.get_xlim()
-
-        visible_indices = [
-            i
-            for i, (ts, te) in enumerate(zip(self._ev_t_start, self._ev_t_end))
-            if te >= xmin and ts <= xmax
-        ]
-
-        if len(visible_indices) > _MAX_LABELS:
-            return
-
+    def _render_labels(self, visible_indices: list[int]):
+        self._clear_labels()
         margin_y = getattr(self, "_margin_y", 5)
         font_size = max(6, min(10, 10 - len(visible_indices) // 50))
         colors_cycle = self._COLORS
 
         for i in visible_indices:
-            color = (self._ev_colors or colors_cycle)[i % len(colors_cycle)]
+            color = (
+                self._ev_colors[i]
+                if getattr(self, "_ev_colors", None) and i < len(self._ev_colors)
+                else colors_cycle[i % len(colors_cycle)]
+            )
+            ev = self.events[i]
+            extra = ev.get("extra_params") or ["1", "7391", "1"]
+            try:
+                ag = int(extra[0]) if len(extra) > 0 else 1
+                up = int(extra[2]) if len(extra) > 2 else 1
+            except (ValueError, TypeError):
+                ag, up = 1, 1
+
+            label_text = f"E{i + 1}"
+            edge_color = color
+            bg_color = "#222222"
+            text_color = color
+
+            if ag == 0:
+                label_text = f"⚠ E{i + 1} (OFF)"
+                edge_color = "#ff4444"
+                text_color = "#ff6666"
+                bg_color = "#2a1515"
+            elif up == 0:
+                master_idx = fgs_parser.find_master_event_idx(self.events, i)
+                if master_idx is not None:
+                    label_text = f"E{i + 1} ↳ E{master_idx + 1}"
+                else:
+                    label_text = f"E{i + 1} ↳ ?"
+                edge_color = "#4da6ff"
+                text_color = "#80c1ff"
+                bg_color = "#15202b"
+
             txt = self.ax.text(
                 self._ev_mid_x[i],
                 self._ev_strength[i] + margin_y * 0.2,
-                f"E{i + 1}",
-                color=color,
+                label_text,
+                color=text_color,
                 ha="center",
                 va="bottom",
                 fontsize=font_size,
                 fontweight="bold",
-                bbox=dict(boxstyle="round", fc="#222222", ec=color, alpha=0.9),
+                bbox=dict(boxstyle="round,pad=0.3", fc=bg_color, ec=edge_color, alpha=0.9),
                 clip_on=True,
             )
             self._label_artists.append(txt)
 
+    def _update_view(self):
+        if not getattr(self, "_ev_t_start", None) or self.ax is None:
+            return
+
+        xmin, xmax = self.ax.get_xlim()
+        import bisect
+        import numpy as np
+
+        left_idx = max(0, bisect.bisect_right(self._ev_t_end, xmin) - 1)
+        right_idx = min(len(self._ev_t_start), bisect.bisect_right(self._ev_t_start, xmax) + 1)
+        n_span = right_idx - left_idx
+
+        if n_span > 1000:
+            if hasattr(self, "_curve_line") and self._curve_line is not None:
+                self._curve_line.set_visible(True)
+            if hasattr(self, "_line_collection") and self._line_collection is not None:
+                self._line_collection.set_visible(False)
+            if hasattr(self, "_scatter_collection") and self._scatter_collection is not None:
+                self._scatter_collection.set_visible(False)
+            self._clear_labels()
+            self._visible_indices = []
+            return
+
+        if hasattr(self, "_curve_line") and self._curve_line is not None:
+            self._curve_line.set_visible(False)
+
+        visible_indices = [
+            i
+            for i in range(left_idx, right_idx)
+            if self._ev_t_end[i] >= xmin and self._ev_t_start[i] <= xmax
+        ]
+        self._visible_indices = visible_indices
+
+        if not visible_indices:
+            if hasattr(self, "_line_collection") and self._line_collection is not None:
+                self._line_collection.set_visible(False)
+            if hasattr(self, "_scatter_collection") and self._scatter_collection is not None:
+                self._scatter_collection.set_visible(False)
+            self._clear_labels()
+            return
+
+        bbox = self.ax.get_window_extent()
+        px_width = bbox.width if bbox.width > 0 else 800.0
+        cur_range = xmax - xmin
+        data_per_px = cur_range / px_width if px_width > 0 else 0.001
+        min_half_w = data_per_px * 1.5
+
+        vis_segs = []
+        vis_colors = []
+        n_total = len(self._ev_t_start)
+        for i in visible_indices:
+            s_i = self._ev_t_start[i]
+            e_i = self._ev_t_end[i]
+            y_i = self._ev_strength[i]
+            if (e_i - s_i) < 2 * min_half_w:
+                m = (s_i + e_i) / 2.0
+                s_i = m - min_half_w
+                e_i = m + min_half_w
+                if i > 0 and s_i < self._ev_t_end[i - 1]:
+                    s_i = self._ev_t_end[i - 1]
+                if i < n_total - 1 and e_i > self._ev_t_start[i + 1]:
+                    e_i = self._ev_t_start[i + 1]
+            vis_gap = min((e_i - s_i) * 0.2, data_per_px * 1.0)
+            if vis_gap > 0:
+                if i > 0 and self._ev_t_start[i] <= self._ev_t_end[i - 1] + 1e-9:
+                    s_i += vis_gap
+                if i < n_total - 1 and self._ev_t_end[i] >= self._ev_t_start[i + 1] - 1e-9:
+                    e_i -= vis_gap
+            vis_segs.append([(s_i, y_i), (e_i, y_i)])
+            vis_colors.append(self._ev_colors[i])
+
+        if hasattr(self, "_line_collection") and self._line_collection is not None:
+            self._line_collection.set_segments(vis_segs)
+            self._line_collection.set_colors(vis_colors)
+            self._line_collection.set_visible(True)
+
+        if len(visible_indices) <= 200 and hasattr(self, "_scatter_collection") and self._scatter_collection is not None:
+            vis_mids = [self._ev_mid_x[i] for i in visible_indices]
+            vis_strengths = [self._ev_strength[i] for i in visible_indices]
+            offsets = np.column_stack([vis_mids, vis_strengths])
+            self._scatter_collection.set_offsets(offsets)
+            self._scatter_collection.set_color(vis_colors)
+            self._scatter_collection.set_visible(True)
+        else:
+            if hasattr(self, "_scatter_collection") and self._scatter_collection is not None:
+                self._scatter_collection.set_visible(False)
+
+        if len(visible_indices) < _MAX_LABELS:
+            self._render_labels(visible_indices)
+        else:
+            self._clear_labels()
+
+    def _update_labels(self):
+        self._update_view()
+
     def on_pick(self, event):
         if event.mouseevent is None or self._pan_active:
             return
-        if event.artist not in (self._line_collection, self._scatter_collection):
-            return
+        idx = None
+        if hasattr(event.mouseevent, "xdata") and event.mouseevent.xdata is not None:
+            idx = self._find_event_at_x(event.mouseevent.xdata)
+        if idx is None and len(event.ind) > 0:
+            local_idx = int(event.ind[0])
+            if hasattr(self, "_visible_indices") and self._visible_indices and 0 <= local_idx < len(self._visible_indices):
+                idx = self._visible_indices[local_idx]
+            elif 0 <= local_idx < len(self.events):
+                idx = local_idx
 
-        indices = event.ind
-        if len(indices) == 0:
-            return
-        idx = int(indices[0])
-
-        if event.mouseevent.button == 1:
+        if idx is not None and event.mouseevent.button == 1:
             self._show_time_edit_bar(idx)
 
     def _confirm_delete(self, idx: int) -> bool:
@@ -1001,8 +1668,47 @@ class DynamicTimelineUI(QWidget):
             return
         self._push_undo()
         self.events.pop(idx)
+        self._ensure_valid_master_chain()
         self.build_timeline()
         self._update_ui_state()
+
+    @staticmethod
+    def _sync_event_e_line(ev: dict) -> None:
+        params_str = " ".join(ev.get("extra_params") or ["1", "7391", "1"])
+        ev["e_line"] = f"E {ev['start_time']} {ev['end_time']} {params_str}\n"
+
+    def _ensure_valid_master_chain(self) -> None:
+        have_model = False
+        master_ev = None
+        for ev in self.events:
+            extra = list(ev.get("extra_params") or ["1", "7391", "1"])
+            if len(extra) < 3:
+                defaults = ["1", "7391", "1"]
+                extra.extend(defaults[len(extra) : 3])
+            ag = extra[0] != "0"
+            up = extra[2] != "0"
+            if not ag:
+                if up:
+                    extra[2] = "0"
+                    ev["extra_params"] = extra
+                    self._sync_event_e_line(ev)
+            else:
+                if not up and not have_model:
+                    extra[2] = "1"
+                    ev["extra_params"] = extra
+                    self._sync_event_e_line(ev)
+                    have_model = True
+                    master_ev = ev
+                elif up:
+                    have_model = True
+                    master_ev = ev
+                elif master_ev is not None:
+                    if "scale_data" in master_ev and master_ev["scale_data"] is not None:
+                        ev["scale_data"] = copy.deepcopy(master_ev["scale_data"])
+                    if "p_params" in master_ev and master_ev["p_params"] is not None:
+                        ev["p_params"] = copy.deepcopy(master_ev["p_params"])
+                    if "raw_lines" in master_ev and master_ev["raw_lines"] is not None:
+                        ev["raw_lines"] = list(master_ev["raw_lines"])
 
     def _delete_event_align(self, idx):
         if not self._confirm_delete(idx):
@@ -1018,14 +1724,32 @@ class DynamicTimelineUI(QWidget):
         self.events.pop(idx)
 
         if has_prev and has_next:
-            mid_t = (t_start + t_end) // 2
+            fps = self._current_fps()
+            mid_raw = (t_start + t_end) // 2
+            if fps > 0:
+                mid_f = ticks_to_frames(mid_raw, fps)
+                prev_start_f = ticks_to_frames(self.events[idx - 1]["start_time"], fps)
+                next_end_f = ticks_to_frames(self.events[idx]["end_time"], fps)
+                mid_f = max(prev_start_f + 1, min(max(prev_start_f + 1, next_end_f - 1), mid_f))
+                mid_t = frames_to_ticks(mid_f, fps)
+            else:
+                mid_t = mid_raw
+            mid_t = max(
+                self.events[idx - 1]["start_time"] + 1,
+                min(self.events[idx]["end_time"] - 1, mid_t),
+            )
             self.events[idx - 1]["end_time"] = mid_t
             self.events[idx]["start_time"] = mid_t
+            self._sync_event_e_line(self.events[idx - 1])
+            self._sync_event_e_line(self.events[idx])
         elif has_prev:
             self.events[idx - 1]["end_time"] = t_end
+            self._sync_event_e_line(self.events[idx - 1])
         elif has_next:
             self.events[idx]["start_time"] = t_start
+            self._sync_event_e_line(self.events[idx])
 
+        self._ensure_valid_master_chain()
         self.build_timeline()
         self._update_ui_state()
 
@@ -1093,18 +1817,25 @@ class DynamicTimelineUI(QWidget):
         new_lines.append(fgs_parser.format_c_line("cCb", new_cb, lag))
         new_lines.append(fgs_parser.format_c_line("cCr", new_cr, lag))
 
-        ep = list(ev_L.get("extra_params", ["1", "7391", "1"]))
+        ep = list(ev_L.get("extra_params") or ["1", "7391", "1"])
+        if len(ep) < 3:
+            defaults = ["1", "7391", "1"]
+            ep.extend(defaults[len(ep) : 3])
+        ep[0] = "1"
+        ep[2] = "1"
 
         new_ev = {
             "start_time": target_start,
             "end_time": target_end,
             "extra_params": ep,
+            "e_line": f"E {target_start} {target_end} {' '.join(ep)}\n",
             "raw_lines": new_lines,
             "scale_data": new_sd,
             "p_params": new_p,
         }
 
         self.events[idx] = new_ev
+        self._ensure_valid_master_chain()
         self.build_timeline()
         self._update_ui_state()
 
@@ -1114,7 +1845,7 @@ class DynamicTimelineUI(QWidget):
         from fgseditor_qt.core.fgs_parser import parse_fgs_events
 
         new_ev = None
-        if template_ev:
+        if template_ev and fgs_parser.get_apply_grain(template_ev) != 0:
             new_ev = copy.deepcopy(template_ev)
             if "raw_lines" in new_ev:
                 new_ev["raw_lines"] = [
@@ -1144,9 +1875,16 @@ class DynamicTimelineUI(QWidget):
                 "p_params": None,
             }
 
+        extra = list(new_ev.get("extra_params") or ["1", "7391", "1"])
+        if len(extra) < 3:
+            defaults = ["1", "7391", "1"]
+            extra.extend(defaults[len(extra) : 3])
+        extra[0] = "1"
+        extra[2] = "1"
+        new_ev["extra_params"] = extra
         new_ev["start_time"] = start_ticks
         new_ev["end_time"] = end_ticks
-        params_str = " ".join(new_ev.get("extra_params", ["1", "7391", "1"]))
+        params_str = " ".join(extra)
         new_ev["e_line"] = f"E {start_ticks} {end_ticks} {params_str}\n"
         return new_ev
 
@@ -1159,16 +1897,17 @@ class DynamicTimelineUI(QWidget):
         prev_end_ticks = prev_ev["end_time"]
         prev_end_frame = ticks_to_frames(prev_end_ticks, fps)
 
-        new_start_frame = prev_end_frame + 1
-        new_start_ticks = max(frames_to_ticks(new_start_frame, fps), prev_end_ticks + 1)
+        new_start_frame = prev_end_frame
+        new_start_ticks = prev_end_ticks
 
         default_dur_frames = max(24, int(round(fps * 2)))
         has_next = (idx + 1) < len(self.events)
 
         if has_next:
             next_ev = self.events[idx + 1]
-            next_start_frame = ticks_to_frames(next_ev["start_time"], fps)
-            if next_start_frame <= new_start_frame:
+            next_start_ticks = next_ev["start_time"]
+            next_start_frame = ticks_to_frames(next_start_ticks, fps)
+            if next_start_ticks <= new_start_ticks or next_start_frame <= new_start_frame:
                 QMessageBox.information(
                     self,
                     "No Space",
@@ -1177,14 +1916,17 @@ class DynamicTimelineUI(QWidget):
                 )
                 return
             new_end_frame = min(new_start_frame + default_dur_frames, next_start_frame)
-            new_end_ticks = min(frames_to_ticks(new_end_frame, fps), next_ev["start_time"])
+            if new_end_frame == next_start_frame:
+                new_end_ticks = next_start_ticks
+            else:
+                new_end_ticks = min(frames_to_ticks(new_end_frame, fps), next_start_ticks)
         else:
             vid_info = getattr(self.main_ui, "_video_info", None)
             from fgseditor_qt.math.time_utils import video_info_to_ticks
-            vid_ticks = video_info_to_ticks(vid_info) if vid_info else 0
+            vid_ticks = video_info_to_ticks(vid_info, fps=fps) if vid_info else 0
             vid_frames = ticks_to_frames(vid_ticks, fps) if vid_ticks > 0 else 0
             if vid_frames > 0:
-                if new_start_frame >= vid_frames:
+                if new_start_frame >= vid_frames or new_start_ticks >= vid_ticks:
                     QMessageBox.information(
                         self,
                         "Video Duration Reached",
@@ -1193,7 +1935,10 @@ class DynamicTimelineUI(QWidget):
                     )
                     return
                 new_end_frame = min(new_start_frame + default_dur_frames, vid_frames)
-                new_end_ticks = min(frames_to_ticks(new_end_frame, fps), vid_ticks)
+                if new_end_frame == vid_frames:
+                    new_end_ticks = vid_ticks
+                else:
+                    new_end_ticks = min(frames_to_ticks(new_end_frame, fps), vid_ticks)
             else:
                 new_end_frame = new_start_frame + default_dur_frames
                 new_end_ticks = frames_to_ticks(new_end_frame, fps)
@@ -1227,21 +1972,27 @@ class DynamicTimelineUI(QWidget):
         default_dur_frames = max(24, int(round(fps * 2)))
 
         if prev_idx is not None:
-            prev_end_frame = ticks_to_frames(self.events[prev_idx]["end_time"], fps)
-            start_frame = max(prev_end_frame + 1, click_frame)
-            min_start_ticks = self.events[prev_idx]["end_time"] + 1
+            prev_end_ticks = self.events[prev_idx]["end_time"]
+            prev_end_frame = ticks_to_frames(prev_end_ticks, fps)
+            start_frame = max(prev_end_frame, click_frame)
+            min_start_ticks = prev_end_ticks
         else:
+            prev_end_ticks = 0
+            prev_end_frame = 0
             start_frame = max(0, click_frame)
             min_start_ticks = 0
 
         vid_info = getattr(self.main_ui, "_video_info", None)
         from fgseditor_qt.math.time_utils import video_info_to_ticks
-        vid_ticks = video_info_to_ticks(vid_info) if vid_info else 0
+        vid_ticks = video_info_to_ticks(vid_info, fps=fps) if vid_info else 0
         vid_frames = ticks_to_frames(vid_ticks, fps) if vid_ticks > 0 else 0
 
         if next_idx is not None:
-            next_start_frame = ticks_to_frames(self.events[next_idx]["start_time"], fps)
-            if start_frame >= next_start_frame:
+            next_start_ticks = self.events[next_idx]["start_time"]
+            next_start_frame = ticks_to_frames(next_start_ticks, fps)
+            if prev_idx is not None and next_start_frame > prev_end_frame and start_frame >= next_start_frame:
+                start_frame = max(prev_end_frame, next_start_frame - 1)
+            if start_frame >= next_start_frame or min_start_ticks >= next_start_ticks:
                 QMessageBox.information(
                     self,
                     "No Gap",
@@ -1249,10 +2000,12 @@ class DynamicTimelineUI(QWidget):
                 )
                 return
             end_frame = min(start_frame + default_dur_frames, next_start_frame)
-            max_end_ticks = self.events[next_idx]["start_time"]
+            max_end_ticks = next_start_ticks
         else:
+            next_start_ticks = None
+            next_start_frame = None
             if vid_frames > 0:
-                if start_frame >= vid_frames:
+                if start_frame >= vid_frames or min_start_ticks >= vid_ticks:
                     QMessageBox.information(
                         self,
                         "Video Duration Reached",
@@ -1266,10 +2019,17 @@ class DynamicTimelineUI(QWidget):
                 end_frame = start_frame + default_dur_frames
                 max_end_ticks = None
 
-        new_start_ticks = max(frames_to_ticks(start_frame, fps), min_start_ticks)
-        new_end_ticks = frames_to_ticks(end_frame, fps)
-        if max_end_ticks is not None:
-            new_end_ticks = min(new_end_ticks, max_end_ticks)
+        if prev_idx is not None and start_frame == prev_end_frame:
+            new_start_ticks = prev_end_ticks
+        else:
+            new_start_ticks = max(frames_to_ticks(start_frame, fps), min_start_ticks)
+
+        if next_idx is not None and end_frame == next_start_frame:
+            new_end_ticks = next_start_ticks
+        else:
+            new_end_ticks = frames_to_ticks(end_frame, fps)
+            if max_end_ticks is not None:
+                new_end_ticks = min(new_end_ticks, max_end_ticks)
 
         if new_end_ticks <= new_start_ticks:
             return
@@ -1327,29 +2087,29 @@ class DynamicTimelineUI(QWidget):
         idx = self._editing_event_idx
         ev = self.events[idx]
 
-        new_start = self._str_to_ticks(self.te_start_input.text())
-        new_end = self._str_to_ticks(self.te_end_input.text())
+        old_start = ev["start_time"]
+        old_end = ev["end_time"]
+
+        if is_start:
+            new_start = self._str_to_ticks(self.te_start_input.text())
+            new_end = old_end
+        else:
+            new_start = old_start
+            new_end = self._str_to_ticks(self.te_end_input.text())
 
         if new_start is None or new_end is None:
             self._update_inline_edit_bar_text()
             return
 
-        old_start = ev["start_time"]
-        old_end = ev["end_time"]
-
         if new_start == old_start and new_end == old_end:
-            return
-
-        if new_start >= new_end:
             self._update_inline_edit_bar_text()
             return
 
         alter_neighbors = self.te_alter_neighbor.isChecked()
         fps = self._current_fps()
-        min_frame_ticks = frames_to_ticks(1, fps) - frames_to_ticks(0, fps)
-
-        if push_undo:
-            self._push_undo()
+        vid_info = getattr(self.main_ui, "_video_info", None)
+        from fgseditor_qt.math.time_utils import video_info_to_ticks
+        vid_ticks = video_info_to_ticks(vid_info, fps=fps) if vid_info else 0
 
         if not alter_neighbors:
             if idx > 0:
@@ -1364,35 +2124,93 @@ class DynamicTimelineUI(QWidget):
                 next_start = self.events[idx + 1]["start_time"]
                 if new_end > next_start:
                     new_end = next_start
+            elif vid_ticks > 0:
+                if new_end > vid_ticks:
+                    new_end = vid_ticks
 
             if new_start >= new_end:
-                if push_undo:
-                    self.undo()
                 self._update_inline_edit_bar_text()
                 return
 
+            if new_start == old_start and new_end == old_end:
+                self._update_inline_edit_bar_text()
+                return
+
+            if push_undo:
+                self._push_undo()
+
             ev["start_time"] = new_start
             ev["end_time"] = new_end
+            self._sync_event_e_line(ev)
         else:
-            ev["start_time"] = new_start
-            ev["end_time"] = new_end
-
-            if idx > 0:
-                prev_ev = self.events[idx - 1]
-                if new_start < prev_ev["start_time"] + min_frame_ticks:
-                    new_start = prev_ev["start_time"] + min_frame_ticks
+            if is_start:
+                max_bound = min(
+                    frames_to_ticks(max(0, ticks_to_frames(old_end, fps) - 1), fps),
+                    old_end - 1,
+                )
+                if idx > 0:
+                    prev_ev = self.events[idx - 1]
+                    min_bound = max(
+                        frames_to_ticks(ticks_to_frames(prev_ev["start_time"], fps) + 1, fps),
+                        prev_ev["start_time"] + 1,
+                    )
+                    if min_bound > max_bound:
+                        self._update_inline_edit_bar_text()
+                        return
+                    new_start = max(min_bound, min(max_bound, new_start))
+                    if new_start == old_start and prev_ev["end_time"] == new_start:
+                        self._update_inline_edit_bar_text()
+                        return
+                    if push_undo:
+                        self._push_undo()
                     ev["start_time"] = new_start
-                prev_ev["end_time"] = new_start
+                    prev_ev["end_time"] = new_start
+                    self._sync_event_e_line(ev)
+                    self._sync_event_e_line(prev_ev)
+                else:
+                    new_start = max(0, min(max_bound, new_start))
+                    if new_start == old_start:
+                        self._update_inline_edit_bar_text()
+                        return
+                    if push_undo:
+                        self._push_undo()
+                    ev["start_time"] = new_start
+                    self._sync_event_e_line(ev)
             else:
-                if new_start < 0:
-                    ev["start_time"] = 0
-
-            if idx < len(self.events) - 1:
-                next_ev = self.events[idx + 1]
-                if new_end > next_ev["end_time"] - min_frame_ticks:
-                    new_end = next_ev["end_time"] - min_frame_ticks
+                min_bound = max(
+                    frames_to_ticks(ticks_to_frames(old_start, fps) + 1, fps),
+                    old_start + 1,
+                )
+                if idx < len(self.events) - 1:
+                    next_ev = self.events[idx + 1]
+                    max_bound = min(
+                        frames_to_ticks(max(0, ticks_to_frames(next_ev["end_time"], fps) - 1), fps),
+                        next_ev["end_time"] - 1,
+                    )
+                    if min_bound > max_bound:
+                        self._update_inline_edit_bar_text()
+                        return
+                    new_end = max(min_bound, min(max_bound, new_end))
+                    if new_end == old_end and next_ev["start_time"] == new_end:
+                        self._update_inline_edit_bar_text()
+                        return
+                    if push_undo:
+                        self._push_undo()
                     ev["end_time"] = new_end
-                next_ev["start_time"] = new_end
+                    next_ev["start_time"] = new_end
+                    self._sync_event_e_line(ev)
+                    self._sync_event_e_line(next_ev)
+                else:
+                    new_end = max(min_bound, new_end)
+                    if vid_ticks > 0:
+                        new_end = min(vid_ticks, new_end)
+                    if new_end <= old_start or new_end == old_end:
+                        self._update_inline_edit_bar_text()
+                        return
+                    if push_undo:
+                        self._push_undo()
+                    ev["end_time"] = new_end
+                    self._sync_event_e_line(ev)
 
         self.build_timeline()
         self._update_ui_state()
@@ -1472,14 +2290,31 @@ class DynamicTimelineUI(QWidget):
         old_start_frames = ticks_to_frames(old_start_ticks, fps)
         old_end_frames = ticks_to_frames(old_end_ticks, fps)
 
+        vid_info = getattr(self.main_ui, "_video_info", None)
+        from fgseditor_qt.math.time_utils import video_info_to_ticks
+        vid_ticks = video_info_to_ticks(vid_info, fps=fps) if vid_info else 0
+
         if idx > 0:
-            min_start_s = ticks_to_seconds(self.events[idx - 1]["end_time"])
-            min_start_frames = (
-                ticks_to_frames(self.events[idx - 1]["end_time"], fps) + 1
-            )
+            min_start_ticks = self.events[idx - 1]["end_time"]
+            min_start_s = ticks_to_seconds(min_start_ticks)
+            min_start_frames = ticks_to_frames(min_start_ticks, fps)
         else:
+            min_start_ticks = 0
             min_start_s = 0.0
             min_start_frames = 0
+
+        if idx < len(self.events) - 1:
+            max_end_ticks = self.events[idx + 1]["start_time"]
+            max_end_s = ticks_to_seconds(max_end_ticks)
+            max_end_frames = ticks_to_frames(max_end_ticks, fps)
+        elif vid_ticks > 0:
+            max_end_ticks = vid_ticks
+            max_end_s = ticks_to_seconds(max_end_ticks)
+            max_end_frames = ticks_to_frames(max_end_ticks, fps)
+        else:
+            max_end_ticks = None
+            max_end_s = 99_999.0
+            max_end_frames = 99_999_999
 
         from PySide6.QtWidgets import (
             QVBoxLayout,
@@ -1523,15 +2358,20 @@ class DynamicTimelineUI(QWidget):
         pf_layout.setContentsMargins(0, 0, 0, 0)
         start_spin_f = QSpinBox()
         start_spin_f.setMinimum(min_start_frames)
-        start_spin_f.setMaximum(99_999_999)
+        start_spin_f.setMaximum(max(min_start_frames, max_end_frames - 1))
         start_spin_f.setValue(old_start_frames)
         pf_layout.addLayout(_row("Start frame:", start_spin_f))
         end_spin_f = QSpinBox()
-        end_spin_f.setMinimum(old_start_frames + 1)
-        end_spin_f.setMaximum(99_999_999)
+        end_spin_f.setMinimum(max(min_start_frames + 1, old_start_frames + 1))
+        end_spin_f.setMaximum(max(min_start_frames + 1, max_end_frames))
         end_spin_f.setValue(old_end_frames)
         pf_layout.addLayout(_row("End frame:  ", end_spin_f))
-        start_spin_f.valueChanged.connect(lambda v: end_spin_f.setMinimum(v + 1))
+        start_spin_f.valueChanged.connect(
+            lambda v: end_spin_f.setMinimum(min(end_spin_f.maximum(), v + 1))
+        )
+        end_spin_f.valueChanged.connect(
+            lambda v: start_spin_f.setMaximum(max(start_spin_f.minimum(), v - 1))
+        )
         stack.addWidget(page_frames)
 
         page_secs = QWidget()
@@ -1540,14 +2380,21 @@ class DynamicTimelineUI(QWidget):
         start_spin_s = QDoubleSpinBox()
         start_spin_s.setDecimals(7)
         start_spin_s.setMinimum(min_start_s)
+        start_spin_s.setMaximum(max(min_start_s, max_end_s - 1e-7))
         start_spin_s.setValue(old_start_s)
         ps_layout.addLayout(_row("Start (s):", start_spin_s))
         end_spin_s = QDoubleSpinBox()
         end_spin_s.setDecimals(7)
-        end_spin_s.setMinimum(old_start_s + 1e-7)
+        end_spin_s.setMinimum(max(min_start_s + 1e-7, old_start_s + 1e-7))
+        end_spin_s.setMaximum(max(min_start_s + 1e-7, max_end_s))
         end_spin_s.setValue(old_end_s)
         ps_layout.addLayout(_row("End (s):   ", end_spin_s))
-        start_spin_s.valueChanged.connect(lambda v: end_spin_s.setMinimum(v + 1e-7))
+        start_spin_s.valueChanged.connect(
+            lambda v: end_spin_s.setMinimum(min(end_spin_s.maximum(), v + 1e-7))
+        )
+        end_spin_s.valueChanged.connect(
+            lambda v: start_spin_s.setMaximum(max(start_spin_s.minimum(), v - 1e-7))
+        )
         stack.addWidget(page_secs)
 
         page_tc = QWidget()
@@ -1567,26 +2414,103 @@ class DynamicTimelineUI(QWidget):
         stack.addWidget(page_tc)
 
         layout.addWidget(stack)
+
+        chk_adjust_neighbors = QCheckBox("Adjust adjacent events (move shared boundaries)")
+        if len(self.events) <= 1:
+            chk_adjust_neighbors.setVisible(False)
+        layout.addWidget(chk_adjust_neighbors)
+
+        def _update_dialog_limits():
+            adj = chk_adjust_neighbors.isChecked()
+            if adj:
+                if idx > 0:
+                    prev_s_ticks = self.events[idx - 1]["start_time"]
+                    eff_min_f = ticks_to_frames(prev_s_ticks, fps) + 1
+                    eff_min_s = ticks_to_seconds(prev_s_ticks) + 1e-7
+                else:
+                    eff_min_f = 0
+                    eff_min_s = 0.0
+                if idx < len(self.events) - 1:
+                    next_e_ticks = self.events[idx + 1]["end_time"]
+                    eff_max_f = max(eff_min_f + 1, ticks_to_frames(next_e_ticks, fps) - 1)
+                    eff_max_s = max(eff_min_s + 1e-7, ticks_to_seconds(next_e_ticks) - 1e-7)
+                elif vid_ticks > 0:
+                    eff_max_f = max(eff_min_f + 1, ticks_to_frames(vid_ticks, fps))
+                    eff_max_s = max(eff_min_s + 1e-7, ticks_to_seconds(vid_ticks))
+                else:
+                    eff_max_f = 99_999_999
+                    eff_max_s = 99_999.0
+            else:
+                eff_min_f = min_start_frames
+                eff_min_s = min_start_s
+                eff_max_f = max(eff_min_f + 1, max_end_frames)
+                eff_max_s = max(eff_min_s + 1e-7, max_end_s)
+
+            start_spin_f.setMinimum(eff_min_f)
+            end_spin_f.setMaximum(eff_max_f)
+            start_spin_f.setMaximum(max(eff_min_f, end_spin_f.value() - 1))
+            end_spin_f.setMinimum(min(eff_max_f, start_spin_f.value() + 1))
+
+            start_spin_s.setMinimum(eff_min_s)
+            end_spin_s.setMaximum(eff_max_s)
+            start_spin_s.setMaximum(max(eff_min_s, end_spin_s.value() - 1e-7))
+            end_spin_s.setMinimum(min(eff_max_s, start_spin_s.value() + 1e-7))
+
+        chk_adjust_neighbors.toggled.connect(lambda _: (_update_dialog_limits(), _update_hint()))
+
         hint = QLabel()
         hint.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(hint)
 
         def _get_ticks():
+            adj = chk_adjust_neighbors.isChecked()
             if rb_frames.isChecked():
-                return (
-                    frames_to_ticks(start_spin_f.value(), fps),
-                    frames_to_ticks(end_spin_f.value(), fps),
-                )
+                sf = start_spin_f.value()
+                ef = end_spin_f.value()
+                if not adj and idx > 0 and sf == min_start_frames:
+                    s = min_start_ticks
+                else:
+                    s = frames_to_ticks(sf, fps)
+                if not adj and max_end_ticks is not None and ef == max_end_frames:
+                    e = max_end_ticks
+                else:
+                    e = frames_to_ticks(ef, fps)
             elif rb_seconds.isChecked():
-                return (
-                    seconds_to_ticks(start_spin_s.value()),
-                    seconds_to_ticks(end_spin_s.value()),
-                )
+                s = seconds_to_ticks(start_spin_s.value())
+                e = seconds_to_ticks(end_spin_s.value())
             else:
-                return (
-                    timecode_to_ticks(start_tc_input.text()),
-                    timecode_to_ticks(end_tc_input.text()),
+                s = timecode_to_ticks(start_tc_input.text())
+                e = timecode_to_ticks(end_tc_input.text())
+
+            if not adj:
+                s = max(min_start_ticks, s)
+                if max_end_ticks is not None:
+                    e = min(max_end_ticks, e)
+                    s = min(s, max(min_start_ticks, e - 1))
+                e = max(s + 1, e)
+            else:
+                lo = (
+                    max(
+                        frames_to_ticks(ticks_to_frames(self.events[idx - 1]["start_time"], fps) + 1, fps),
+                        self.events[idx - 1]["start_time"] + 1,
+                    )
+                    if idx > 0
+                    else 0
                 )
+                hi = (
+                    min(
+                        frames_to_ticks(max(0, ticks_to_frames(self.events[idx + 1]["end_time"], fps) - 1), fps),
+                        self.events[idx + 1]["end_time"] - 1,
+                    )
+                    if idx < len(self.events) - 1
+                    else (vid_ticks if vid_ticks > 0 else None)
+                )
+                s = max(lo, s)
+                if hi is not None:
+                    e = min(hi, e)
+                    s = min(s, max(lo, e - 1))
+                e = max(s + 1, e)
+            return s, e
 
         def _update_hint():
             s, e = _get_ticks()
@@ -1614,10 +2538,19 @@ class DynamicTimelineUI(QWidget):
 
         if dialog.exec():
             new_s, new_e = _get_ticks()
-            if new_s != old_start_ticks or new_e != old_end_ticks:
+            adj = chk_adjust_neighbors.isChecked()
+            if new_s != old_start_ticks or new_e != old_end_ticks or adj:
                 self._push_undo()
                 ev["start_time"] = new_s
                 ev["end_time"] = new_e
+                self._sync_event_e_line(ev)
+                if adj:
+                    if idx > 0 and new_s != old_start_ticks:
+                        self.events[idx - 1]["end_time"] = new_s
+                        self._sync_event_e_line(self.events[idx - 1])
+                    if idx < len(self.events) - 1 and new_e != old_end_ticks:
+                        self.events[idx + 1]["start_time"] = new_e
+                        self._sync_event_e_line(self.events[idx + 1])
                 self.build_timeline()
                 self._update_ui_state()
 
@@ -1725,7 +2658,7 @@ class DynamicTimelineUI(QWidget):
                 self.file_label.setText(f"File: {self.filepath} | Video: {vname}")
             else:
                 self.file_label.setText(f"File: {self.filepath}")
-            self.original_events = copy.deepcopy(self.events)
+            self.original_events = _clone_events(self.events)
             self.original_fps_text = self.fps_combo.currentText()
             self._has_sanitization_changes = False
             self._update_ui_state()
@@ -1867,8 +2800,9 @@ class DynamicTimelineUI(QWidget):
         self.file_label.setText(text)
 
     def set_save_apply_enabled(self, enabled: bool, tooltip: str = ""):
+        self._save_apply_enabled_state = bool(enabled)
         self.save_apply_btn.setVisible(True)
-        self.save_apply_btn.setEnabled(enabled)
+        self.save_apply_btn.setEnabled(bool(enabled) and not self._is_clipping_busy())
         if tooltip:
             self.save_apply_btn.setToolTip(tooltip)
 
@@ -2081,11 +3015,128 @@ class DynamicTimelineUI(QWidget):
                 f"Failed to apply film grain:\n\n{msg}\n\nFGS used: {self.filepath}",
             )
 
+    def _finish_clipping_progress_ui(self) -> bool:
+        """Restore canvas view and toolbar state after FixClippingWorker ends."""
+        worker = getattr(self, "_fix_clipping_worker", None)
+        self._fix_clipping_worker = None
+        if worker is not None:
+            worker.wait(2000)
+            worker.deleteLater()
+        if self.canvas is None:
+            return False
+        self.progress_cancel_btn.hide()
+        self.progress_cancel_btn.setEnabled(True)
+        self.progress_label.setText("Calculating timeline data...")
+        self.main_stack.setCurrentWidget(self.canvas)
+        self._update_ui_state()
+        return True
+
+    def _cancel_fix_clipping(self) -> None:
+        """Request cancellation of a running background clipping fix."""
+        worker = getattr(self, "_fix_clipping_worker", None)
+        if worker is not None and worker.isRunning():
+            self.progress_cancel_btn.setEnabled(False)
+            self.progress_label.setText("Cancelling clipping fix...")
+            worker.cancel()
+
+    def _on_fix_clipping_cancelled(self) -> None:
+        self._finish_clipping_progress_ui()
+
+    def _on_fix_clipping_error(self, err_msg: str) -> None:
+        if not self._finish_clipping_progress_ui():
+            return
+        QMessageBox.critical(
+            self,
+            "Fix Clipping Error",
+            f"Failed to fix clipping:\n{err_msg}",
+        )
+
+    def _on_fix_clipping_ready(self, result: tuple) -> None:
+        if not self._finish_clipping_progress_ui():
+            return
+        cloned_events, modified_count, max_shift_overall = result
+
+        if modified_count == 0:
+            QMessageBox.information(
+                self,
+                "Fix Clipping",
+                "No clipping detected across all events and channels.",
+            )
+            return
+
+        if max_shift_overall > 4:
+            reply = QMessageBox.warning(
+                self,
+                "Fix Clipping Warning",
+                "One or more events require an automatic shift greater than 4 positions "
+                f"(maximum calculated shift: {max_shift_overall} positions).\n\n"
+                "This might significantly alter grain behavior. It is recommended to manually reduce point intensities.\n\n"
+                "Do you want to proceed with the automatic shift for all events anyway?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self._push_undo()
+        self.events = cloned_events
+        self._has_sanitization_changes = True
+        self.build_timeline()
+        self._update_ui_state()
+
+        QMessageBox.information(
+            self,
+            "Fix Clipping",
+            f"Clipping fixed across {modified_count} event(s) in all channels.",
+        )
+
+    def fix_clipping_all_events(self) -> None:
+        """Apply clipping fix across all events and channels off the UI thread."""
+        if not self.events or self._is_clipping_busy() or self._is_timeline_busy():
+            return
+
+        from fgseditor_qt.ui.panels.utils import ask_fix_clipping_options
+
+        proceed, fix_endpoints = ask_fix_clipping_options(self, is_dynamic=True)
+        if not proceed:
+            return
+
+        if getattr(self, "editor", None) is not None:
+            if not self.editor.close():
+                return
+
+        v_info = getattr(self.main_ui, "_video_info", None) or {}
+        bit_depth = v_info.get("bit_depth", 8)
+        is_444 = bool(v_info.get("is_444", False))
+
+        cloned_events = _clone_events(self.events)
+
+        self.progress_label.setText("Fixing clipping across timeline...")
+        self.progress_bar.setValue(0)
+        self.progress_cancel_btn.setEnabled(True)
+        self.progress_cancel_btn.show()
+        self.main_stack.setCurrentWidget(self.progress_container)
+        self._apply_toolbar_busy_state(fix_busy=True, timeline_busy=False)
+
+        worker = FixClippingWorker(
+            cloned_events,
+            bit_depth,
+            v_info,
+            is_444,
+            fix_endpoints=fix_endpoints,
+        )
+        self._fix_clipping_worker = worker
+        worker.progress.connect(self.progress_bar.setValue)
+        worker.finished_fix.connect(self._on_fix_clipping_ready)
+        worker.cancelled.connect(self._on_fix_clipping_cancelled)
+        worker.error_occurred.connect(self._on_fix_clipping_error)
+        worker.start()
+
     def save_plot_as_png(self):
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Plot",
-            os.path.join(get_base_dir(), "timeline.png"),
+            os.path.join(get_user_data_dir(), "timeline.png"),
             "PNG (*.png)",
         )
         if save_path:
@@ -2116,8 +3167,13 @@ class DynamicTimelineUI(QWidget):
             self.reset_zoom()
             return
 
-        new_xmin = max(full_xmin, new_xmin)
-        new_xmax = min(full_xmax, new_xmax)
+        min_left = -max(1e-4, new_range * 0.008) if full_xmin < 0 else full_xmin
+        if new_xmin < min_left:
+            new_xmin = min_left
+            new_xmax = min(full_xmax, new_xmin + new_range)
+        if new_xmax > full_xmax:
+            new_xmax = full_xmax
+            new_xmin = max(min_left, new_xmax - new_range)
 
         self._zoom_xlim = (new_xmin, new_xmax)
         self.ax.set_xlim(new_xmin, new_xmax)
@@ -2132,7 +3188,17 @@ class DynamicTimelineUI(QWidget):
     def _on_mouse_press(self, event):
         if event.inaxes == self.ax:
             if event.dblclick:
-                self.reset_zoom()
+                self._select_active = False
+                if (
+                    event.button == 1
+                    and event.xdata is not None
+                    and not self._is_clipping_busy()
+                    and not self._is_timeline_busy()
+                    and bool(getattr(self, "_label_artists", None))
+                ):
+                    idx = self._find_event_at_x(event.xdata)
+                    if idx is not None and 0 <= idx < len(self.events):
+                        self.open_editor(idx)
                 return
 
             if event.button == 3:
@@ -2176,20 +3242,67 @@ class DynamicTimelineUI(QWidget):
             new_xmax = cur_xmax - dx_data
 
             full_xmin, full_xmax = self._xlim_full
+            cur_range = cur_xmax - cur_xmin
+            min_left = -max(1e-4, cur_range * 0.008) if full_xmin < 0 else full_xmin
 
-            if new_xmin < full_xmin:
-                diff = full_xmin - new_xmin
-                new_xmin += diff
-                new_xmax += diff
             if new_xmax > full_xmax:
                 diff = new_xmax - full_xmax
-                new_xmin -= diff
                 new_xmax -= diff
+                new_xmin -= diff
+            if new_xmin < min_left:
+                diff = min_left - new_xmin
+                new_xmin += diff
+                new_xmax += diff
+            new_xmin = max(min_left, new_xmin)
+            new_xmax = min(full_xmax, new_xmax)
 
             self._zoom_xlim = (new_xmin, new_xmax)
             self.ax.set_xlim(new_xmin, new_xmax)
             self._update_labels()
             self.canvas.draw_idle()
+
+        # Hover tooltips for timeline events
+        if (
+            event.inaxes == self.ax
+            and event.xdata is not None
+            and not self._pan_active
+            and not self._select_active
+        ):
+            hovered_idx = self._find_event_at_x(event.xdata)
+
+            if hovered_idx is not None and hovered_idx < len(self.events):
+                ev = self.events[hovered_idx]
+                extra = ev.get("extra_params") or ["1", "7391", "1"]
+                try:
+                    ag = int(extra[0]) if len(extra) > 0 else 1
+                    up = int(extra[2]) if len(extra) > 2 else 1
+                except (ValueError, TypeError):
+                    ag, up = 1, 1
+
+                tip_parts = [f"Event {hovered_idx + 1}"]
+                if ag == 0:
+                    tip_parts.append("⚠ Film grain is disabled for this event (apply_grain = 0)")
+                elif up == 0:
+                    m_idx = fgs_parser.find_master_event_idx(self.events, hovered_idx)
+                    if m_idx is not None:
+                        tip_parts.append(f"↳ Linked to Event E{m_idx + 1} (update_parameters = 0)")
+                    else:
+                        tip_parts.append("↳ update_parameters = 0 (Uninitialized master)")
+                else:
+                    seed_val = extra[1] if len(extra) > 1 else "7391"
+                    tip_parts.append(f"Active film grain (Seed: {seed_val})")
+                    linked = fgs_parser.find_linked_event_indices(self.events, hovered_idx)
+                    if linked:
+                        if len(linked) <= 8:
+                            linked_str = ", ".join(f"E{idx + 1}" for idx in linked)
+                        else:
+                            head = ", ".join(f"E{idx + 1}" for idx in linked[:6])
+                            linked_str = f"{head}, ..., E{linked[-1] + 1} (+{len(linked) - 7} more)"
+                        tip_parts.append(f"Master for linked event(s): {linked_str} (update_parameters = 0)")
+
+                self.canvas.setToolTip("\n".join(tip_parts))
+            else:
+                self.canvas.setToolTip("")
 
     def _on_mouse_release(self, event):
         if event.button == 3:
@@ -2208,7 +3321,11 @@ class DynamicTimelineUI(QWidget):
                 xmin = min(self._select_start_x, event.xdata)
                 xmax = max(self._select_start_x, event.xdata)
 
-                if xmax - xmin > 0.001:
+                bbox = self.ax.get_window_extent()
+                cur_range = self.ax.get_xlim()[1] - self.ax.get_xlim()[0]
+                drag_px = (xmax - xmin) * (bbox.width / cur_range) if cur_range > 0 else 0
+
+                if drag_px > 5:
                     selected = []
                     for i, (t_s, t_e) in enumerate(
                         zip(self._ev_t_start, self._ev_t_end)
@@ -2228,21 +3345,15 @@ class DynamicTimelineUI(QWidget):
                     if self._select_overlay:
                         self._select_overlay.remove()
                         self._select_overlay = None
+                    ev_idx = self._find_event_at_x(event.xdata)
+                    if ev_idx is not None:
+                        self._show_time_edit_bar(ev_idx)
                     self.canvas.draw_idle()
 
     def _handle_right_click_anywhere(self, xdata):
         if xdata is None:
             return
-
-        click_ticks = seconds_to_ticks(xdata)
-
-        found_idx = None
-        if self.events:
-            for idx, ev in enumerate(self.events):
-                if ev["start_time"] <= click_ticks <= ev["end_time"]:
-                    found_idx = idx
-                    break
-
+        found_idx = self._find_event_at_x(xdata)
         if found_idx is not None:
             self._show_event_context_menu(found_idx, xdata)
         else:
@@ -2251,6 +3362,7 @@ class DynamicTimelineUI(QWidget):
     def _on_mouse_leave(self, event):
         self._pan_active = False
         self._select_active = False
+        self.canvas.setToolTip("")
 
     def reset_zoom(self):
         if self._xlim_full is not None:
@@ -2306,6 +3418,7 @@ class DynamicTimelineUI(QWidget):
         self._push_undo()
         for idx in sorted(indices, reverse=True):
             self.events.pop(idx)
+        self._ensure_valid_master_chain()
         self.build_timeline()
         self._update_ui_state()
 
@@ -2325,14 +3438,32 @@ class DynamicTimelineUI(QWidget):
             self.events.pop(idx)
 
         if has_prev and has_next:
-            mid_t = (t_start + t_end) // 2
+            fps = self._current_fps()
+            mid_raw = (t_start + t_end) // 2
+            if fps > 0:
+                mid_f = ticks_to_frames(mid_raw, fps)
+                prev_start_f = ticks_to_frames(self.events[first_idx - 1]["start_time"], fps)
+                next_end_f = ticks_to_frames(self.events[first_idx]["end_time"], fps)
+                mid_f = max(prev_start_f + 1, min(max(prev_start_f + 1, next_end_f - 1), mid_f))
+                mid_t = frames_to_ticks(mid_f, fps)
+            else:
+                mid_t = mid_raw
+            mid_t = max(
+                self.events[first_idx - 1]["start_time"] + 1,
+                min(self.events[first_idx]["end_time"] - 1, mid_t),
+            )
             self.events[first_idx - 1]["end_time"] = mid_t
             self.events[first_idx]["start_time"] = mid_t
+            self._sync_event_e_line(self.events[first_idx - 1])
+            self._sync_event_e_line(self.events[first_idx])
         elif has_prev:
             self.events[first_idx - 1]["end_time"] = t_end
+            self._sync_event_e_line(self.events[first_idx - 1])
         elif has_next:
             self.events[first_idx]["start_time"] = t_start
+            self._sync_event_e_line(self.events[first_idx])
 
+        self._ensure_valid_master_chain()
         self.build_timeline()
         self._update_ui_state()
 
@@ -2401,12 +3532,18 @@ class DynamicTimelineUI(QWidget):
         new_lines.append(fgs_parser.format_c_line("cCb", new_cb, lag))
         new_lines.append(fgs_parser.format_c_line("cCr", new_cr, lag))
 
-        ep = list(ev_L.get("extra_params", ["1", "7391", "1"]))
+        ep = list(ev_L.get("extra_params") or ["1", "7391", "1"])
+        if len(ep) < 3:
+            defaults = ["1", "7391", "1"]
+            ep.extend(defaults[len(ep) : 3])
+        ep[0] = "1"
+        ep[2] = "1"
 
         new_ev = {
             "start_time": target_start,
             "end_time": target_end,
             "extra_params": ep,
+            "e_line": f"E {target_start} {target_end} {' '.join(ep)}\n",
             "raw_lines": new_lines,
             "scale_data": new_sd,
             "p_params": new_p,
@@ -2417,6 +3554,7 @@ class DynamicTimelineUI(QWidget):
 
         self.events.insert(first_idx, new_ev)
 
+        self._ensure_valid_master_chain()
         self.build_timeline()
         self._update_ui_state()
 

@@ -7,6 +7,32 @@ from fgseditor_qt.core.AFGS_TABLE_and_SEEDS import CHERRY_SEEDS
 
 
 
+_PAYLOAD_KEYS = (
+    "ar_coeff_lag",
+    "ar_coeff_shift",
+    "grain_scale_shift",
+    "scaling_shift",
+    "chroma_scaling_from_luma",
+    "overlap_flag",
+    "cb_mult",
+    "cb_luma_mult",
+    "cb_offset",
+    "cr_mult",
+    "cr_luma_mult",
+    "cr_offset",
+    "clip_to_restricted_range",
+    "num_y_points",
+    "y_points",
+    "num_cb_points",
+    "cb_points",
+    "num_cr_points",
+    "cr_points",
+    "y_ar_coeffs",
+    "cb_ar_coeffs",
+    "cr_ar_coeffs",
+)
+
+
 def parse_and_pack(input_file, output_file, fps=24.0, fallback_frames=150000, static_mode=False):
     with open(input_file, "r", encoding="utf-8") as f:
         lines = [line.strip() for line in f.readlines() if line.strip()]
@@ -41,6 +67,7 @@ def parse_and_pack(input_file, output_file, fps=24.0, fallback_frames=150000, st
         events.append(current_event)
 
     bin_data = bytearray()
+    last_master_payload: dict | None = None
 
     for event_lines in events:
         params = {}
@@ -91,14 +118,50 @@ def parse_and_pack(input_file, output_file, fps=24.0, fallback_frames=150000, st
             elif key in ("cCr", "Cr", "ccr", "cr"):
                 params["cr_ar_coeffs"] = values
 
+        apply_grain = 1 if params.get("apply_grain", 1) != 0 else 0
+        update_parameters = 1 if params.get("update_parameters", 1) != 0 else 0
+        params["apply_grain"] = apply_grain
+        if apply_grain == 0:
+            params["update_parameters"] = 0
+            params["num_y_points"] = 0
+            params["num_cb_points"] = 0
+            params["num_cr_points"] = 0
+            params["y_points"] = []
+            params["cb_points"] = []
+            params["cr_points"] = []
+        elif update_parameters != 0:
+            params["update_parameters"] = 1
+            last_master_payload = {
+                k: (list(params[k]) if isinstance(params[k], list) else params[k])
+                for k in _PAYLOAD_KEYS
+                if k in params
+            }
+        else:
+            if last_master_payload is not None:
+                params["update_parameters"] = 0
+                for k in _PAYLOAD_KEYS:
+                    params.pop(k, None)
+                for k, v in last_master_payload.items():
+                    params[k] = list(v) if isinstance(v, list) else v
+            else:
+                params["update_parameters"] = 1
+                last_master_payload = {
+                    k: (list(params[k]) if isinstance(params[k], list) else params[k])
+                    for k in _PAYLOAD_KEYS
+                    if k in params
+                }
+
         start_t = params.get("start_time", 0)
         end_t = params.get("end_time", 0)
 
         if len(events) == 1 and (end_t <= start_t or end_t == 0):
             event_frames = fallback_frames
         else:
-            dur_s = (end_t - start_t) / 10000000.0
-            event_frames = max(1, round(dur_s * fps)) if end_t > start_t else 0
+            from fgseditor_qt.math.time_utils import ticks_to_frames
+            if end_t > start_t:
+                event_frames = max(1, ticks_to_frames(end_t, fps) - ticks_to_frames(start_t, fps))
+            else:
+                event_frames = 0
             if event_frames <= 0:
                 continue
 

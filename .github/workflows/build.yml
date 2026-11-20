@@ -43,11 +43,12 @@ jobs:
         run: |
           python -m nuitka --standalone --windows-console-mode=disable ^
             --plugin-enable=pyside6 ^
+            --plugin-enable=multiprocessing ^
             --windows-icon-from-ico=images/icon.ico ^
             --windows-company-name="PingWer" ^
             --windows-product-name="FGSEditor" ^
-            --windows-file-version="5.1.0.0" ^
-            --windows-product-version="5.1.0.0" ^
+            --windows-file-version="5.2.0.0" ^
+            --windows-product-version="5.2.0.0" ^
             --windows-file-description="Film Grain Strength Editor" ^
             --output-dir=dist fgseditor_qt/fgsview_loader.py ^
             --include-package=fgseditor_qt ^

@@ -1,3 +1,5 @@
+__version__ = "5.2.0"
+
 from . import core
 from . import math
 from . import tools

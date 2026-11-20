@@ -41,31 +41,7 @@ SMPTE240_BETA = 0.022821585529445
 SMPTE240_THRESH = 4.0 * SMPTE240_BETA  # 0.09128634211778
 
 
-# Color Space <-> Linear Conversions
-def gamma22_to_linear(g):
-    return max(0.0, g) ** 2.2
-
-
-def gamma22_from_linear(l):  # noqa: E741
-    return max(0.0, l) ** (1.0 / 2.2)
-
-
-def gamma28_to_linear(g):
-    return max(0.0, g) ** 2.8
-
-
-def gamma28_from_linear(l):  # noqa: E741
-    return max(0.0, l) ** (1.0 / 2.8)
-
-
-def gamma24_to_linear(g):
-    return max(0.0, g) ** 2.4
-
-
-def gamma24_from_linear(l):  # noqa: E741
-    return max(0.0, l) ** (1.0 / 2.4)
-
-
+# Color Space <-> Linear Conversions & C-Infinity Analytical Derivatives
 def srgb_to_linear(srgb):
     srgb = max(0.0, srgb)
     return srgb / 12.92 if srgb <= 0.04045 else ((srgb + 0.055) / 1.055) ** 2.4
@@ -78,6 +54,12 @@ def srgb_from_linear(linear):
         if linear <= 0.0031308
         else 1.055 * (linear ** (1.0 / 2.4)) - 0.055
     )
+
+
+def srgb_derivative(linear):
+    # C-infinity quadrature knee matching 12.92 at L = 0 and IEC 61966-2-1 power branch for L >> 0.003
+    l_eff = math.hypot(max(0.0, linear), 0.003041229589675751)
+    return (1.055 / 2.4) * (l_eff ** (-1.4 / 2.4))
 
 
 def pq_to_linear(pq):
@@ -94,23 +76,47 @@ def pq_from_linear(linear):
     return ((PQ_C1 + PQ_C2 * linear_pow_m1) / (1.0 + PQ_C3 * linear_pow_m1)) ** PQ_M2
 
 
+def pq_derivative(linear):
+    l_safe = max(1e-12, linear)
+    l_m1 = l_safe**PQ_M1
+    num = PQ_C1 + PQ_C2 * l_m1
+    den = 1.0 + PQ_C3 * l_m1
+    base = num / den
+    d_base = (PQ_M1 * (l_safe ** (PQ_M1 - 1.0)) * (PQ_C2 - PQ_C1 * PQ_C3)) / (den * den)
+    return PQ_M2 * (base ** (PQ_M2 - 1.0)) * d_base
+
+
+# Pure ARIB STD-B67 / ITU-R BT.2100 Table 5 Container OETF (Scene-Referred, no 1.2 monitor OOTF)
+HLG_MID_TONE = (26.0 / 1000.0) ** (1.0 / 1.2)
+
+
 def hlg_to_linear(hlg):
     hlg = max(0.0, hlg)
-    linear = (
+    return (
         hlg * hlg / 3.0
         if hlg <= 0.5
         else (math.exp((hlg - HLG_C) / HLG_A) + HLG_B) / 12.0
     )
-    return linear**1.2
 
 
 def hlg_from_linear(linear):
-    linear = max(0.0, linear) ** (1.0 / 1.2)
+    linear = max(0.0, linear)
     return (
         math.sqrt(3.0 * linear)
         if linear <= 1.0 / 12.0
         else HLG_A * math.log(12.0 * linear - HLG_B) + HLG_C
     )
+
+
+def hlg_derivative(linear):
+    # C-infinity relative-softplus transition at E = 1/12 avoiding the 0.5 OETF slope cusp
+    e_safe = max(1e-12, linear)
+    g1 = (2.0 / math.sqrt(3.0)) * math.sqrt(e_safe)
+    g2 = (12.0 * e_safe - HLG_B) / (12.0 * HLG_A)
+    diff = g2 - g1
+    eps_rel = 0.08 * g1
+    soft_pos = 0.5 * (diff + math.sqrt(diff * diff + eps_rel * eps_rel))
+    return 1.0 / max(1e-12, g1 + soft_pos)
 
 
 def bt601_to_linear(E):
@@ -131,6 +137,12 @@ def bt601_from_linear(L):
     )
 
 
+def bt601_derivative(L):
+    # C-infinity quadrature knee matching 4.5 at L = 0 and 0.45 * alpha * L^-0.55 above BT709_BETA
+    l_eff = math.hypot(max(0.0, L), BT709_BETA)
+    return 0.45 * BT709_ALPHA * (l_eff**-0.55)
+
+
 def smpte240m_to_linear(x):
     x = max(0.0, x)
     return (
@@ -149,12 +161,21 @@ def smpte240m_from_linear(y):
     )
 
 
+def smpte240m_derivative(L):
+    l_eff = math.hypot(max(0.0, L), SMPTE240_BETA)
+    return 0.45 * SMPTE240_ALPHA * (l_eff**-0.55)
+
+
 def identity_to_linear(x):
     return x
 
 
 def identity_from_linear(x):
     return x
+
+
+def identity_derivative(_L):
+    return 1.0
 
 
 def log100_to_linear(x):
@@ -167,6 +188,10 @@ def log100_from_linear(y):
     return math.log10(100.0 * y + 1.0) / math.log10(101.0)
 
 
+def log100_derivative(L):
+    return 100.0 / (math.log(101.0) * (100.0 * max(0.0, L) + 1.0))
+
+
 def log100_sqrt10_to_linear(x):
     x = max(0.0, x)
     scale = 100.0 * 3.1622776601683795
@@ -177,6 +202,11 @@ def log100_sqrt10_from_linear(y):
     y = max(0.0, y)
     scale = 100.0 * 3.1622776601683795
     return math.log10(scale * y + 1.0) / math.log10(scale + 1.0)
+
+
+def log100_sqrt10_derivative(L):
+    scale = 100.0 * 3.1622776601683795
+    return scale / (math.log(scale + 1.0) * (scale * max(0.0, L) + 1.0))
 
 
 def iec61966_to_linear(x):
@@ -195,125 +225,279 @@ def bt1361_from_linear(y):
     return bt601_from_linear(y)
 
 
-def smpte428_to_linear(x):  # gamma 2.6
-    return (52.37 / 48.0) * max(x, 0.0) ** 2.6
+# Authoring & Camera Log Working Spaces (Scene-Referred, L_mid = 0.18)
+def acescct_to_linear(v):
+    return (
+        (v - 0.0729055341958355) / 10.5402377416545
+        if v <= 0.155251141552511
+        else 2.0 ** (17.52 * v - 9.72)
+    )
 
 
-def smpte428_from_linear(y):
-    return (48.0 / 52.37 * max(y, 0.0)) ** (1.0 / 2.6)
+def acescct_from_linear(L):
+    L = max(0.0, L)
+    return (
+        10.5402377416545 * L + 0.0729055341958355
+        if L <= 0.0078125
+        else (math.log2(L) + 9.72) / 17.52
+    )
+
+
+def acescct_derivative(L):
+    l_eff = math.hypot(max(0.0, L), 0.0078125)
+    return 1.0 / (17.52 * math.log(2.0) * l_eff)
+
+
+_DI_A = 0.0075
+_DI_B = 7.0
+_DI_C = 0.07329248
+_DI_M = 10.44426855
+_DI_LCUT = 0.00262409
+_DI_VCUT = 0.02740668
+_DI_DENOM_BIAS = (_DI_C / (_DI_M * math.log(2.0))) ** 2 - (_DI_A**2)
+
+
+def davinci_intermediate_to_linear(v):
+    return v / _DI_M if v <= _DI_VCUT else (2.0 ** (v / _DI_C - _DI_B)) - _DI_A
+
+
+def davinci_intermediate_from_linear(L):
+    L = max(0.0, L)
+    return _DI_M * L if L <= _DI_LCUT else (math.log2(L + _DI_A) + _DI_B) * _DI_C
+
+
+def davinci_intermediate_derivative(L):
+    l_shift = max(0.0, L) + _DI_A
+    denom = math.sqrt(l_shift * l_shift + _DI_DENOM_BIAS)
+    return _DI_C / (math.log(2.0) * denom)
+
+
+_LC3_A = 5.555556
+_LC3_B = 0.052272
+_LC3_C = 0.247190
+_LC3_D = 0.385537
+_LC3_E = 5.367655
+_LC3_F = 0.092809
+_LC3_LCUT = 0.010591
+_LC3_VCUT = 0.149658
+_LC3_BIAS = (_LC3_A * _LC3_LCUT + _LC3_B) ** 2 - (_LC3_B**2)
+
+
+def logc3_to_linear(v):
+    return (
+        (v - _LC3_F) / _LC3_E
+        if v <= _LC3_VCUT
+        else ((10.0 ** ((v - _LC3_D) / _LC3_C)) - _LC3_B) / _LC3_A
+    )
+
+
+def logc3_from_linear(L):
+    L = max(0.0, L)
+    return (
+        _LC3_E * L + _LC3_F
+        if L <= _LC3_LCUT
+        else _LC3_C * math.log10(_LC3_A * L + _LC3_B) + _LC3_D
+    )
+
+
+def logc3_derivative(L):
+    u_shift = _LC3_A * max(0.0, L) + _LC3_B
+    denom = math.sqrt(u_shift * u_shift + _LC3_BIAS)
+    return (_LC3_C * _LC3_A) / (math.log(10.0) * denom)
+
+
+_LC4_A = (2**18 - 16) / 117.45
+_LC4_B = (1023.0 - 95.0) / 1023.0
+_LC4_C = 95.0 / 1023.0
+_LC4_S = (7.0 * math.log(2.0) * (2.0 ** (7.0 - 14.0 * _LC4_C / _LC4_B))) / (_LC4_A * _LC4_B)
+_LC4_T = ((2.0 ** (6.0 - 14.0 * _LC4_C / _LC4_B)) - 64.0) / _LC4_A
+
+
+def logc4_to_linear(v):
+    return (
+        _LC4_S * v + _LC4_T
+        if v < 0.0
+        else ((2.0 ** (14.0 * ((v - _LC4_C) / _LC4_B) + 6.0)) - 64.0) / _LC4_A
+    )
+
+
+def logc4_from_linear(L):
+    return (
+        (L - _LC4_T) / _LC4_S
+        if L < _LC4_T
+        else ((math.log2(_LC4_A * L + 64.0) - 6.0) / 14.0) * _LC4_B + _LC4_C
+    )
+
+
+def logc4_derivative(L):
+    return (_LC4_A * _LC4_B) / (14.0 * math.log(2.0) * (_LC4_A * max(0.0, L) + 64.0))
+
+
+_SL3_LCUT = 0.01125
+_SL3_VCUT = 171.2102946929 / 1023.0
+_SL3_BIAS = (_SL3_LCUT + 0.01) ** 2 - (0.01**2)
+
+
+def slog3_to_linear(v):
+    if v < _SL3_VCUT:
+        return (v * 1023.0 - 95.0) * _SL3_LCUT / (171.2102946929 - 95.0)
+    return (10.0 ** ((v * 1023.0 - 420.0) / 261.5)) * 0.19 - 0.01
+
+
+def slog3_from_linear(L):
+    L = max(0.0, L)
+    if L < _SL3_LCUT:
+        return (L * (171.2102946929 - 95.0) / _SL3_LCUT + 95.0) / 1023.0
+    return (420.0 + 261.5 * math.log10((L + 0.01) / 0.19)) / 1023.0
+
+
+def slog3_derivative(L):
+    l_shift = max(0.0, L) + 0.01
+    denom = math.sqrt(l_shift * l_shift + _SL3_BIAS)
+    return 261.5 / (1023.0 * math.log(10.0) * denom)
+
+
+_L3G10_A = 0.224282
+_L3G10_B = 155.975327
+_L3G10_C = 0.01
+_L3G10_G = 15.1927
+
+
+def log3g10_to_linear(v):
+    return (
+        v / _L3G10_G - _L3G10_C
+        if v < 0.0
+        else ((10.0 ** (v / _L3G10_A)) - 1.0) / _L3G10_B - _L3G10_C
+    )
+
+
+def log3g10_from_linear(L):
+    return (
+        (L + _L3G10_C) * _L3G10_G
+        if L < -_L3G10_C
+        else _L3G10_A * math.log10((L + _L3G10_C) * _L3G10_B + 1.0)
+    )
+
+
+def log3g10_derivative(L):
+    return (_L3G10_A * _L3G10_B) / (
+        math.log(10.0) * ((max(0.0, L) + _L3G10_C) * _L3G10_B + 1.0)
+    )
 
 
 class TransferFunction:
-    def __init__(self, to_linear_fn, from_linear_fn, mid_tone):
+    def __init__(
+        self,
+        to_linear_fn,
+        from_linear_fn,
+        mid_tone,
+        derivative_fn=None,
+        max_linear=1.0,
+        label=None,
+    ):
         self.to_linear = to_linear_fn
         self.from_linear = from_linear_fn
         self.mid_tone = mid_tone
+        self.derivative = derivative_fn
+        self.max_linear = max_linear
+        self.label = label
 
 
-# CICP Mapping Dictionary
-
-TFS = {
-    "BT_601": TransferFunction(bt601_to_linear, bt601_from_linear, 0.18),
-    "SRGB": TransferFunction(srgb_to_linear, srgb_from_linear, 0.18),
-    "GAMMA22": TransferFunction(gamma22_to_linear, gamma22_from_linear, 0.18),
-    "GAMMA28": TransferFunction(gamma28_to_linear, gamma28_from_linear, 0.18),
-    "GAMMA24": TransferFunction(gamma24_to_linear, gamma24_from_linear, 0.18),
-    "SMPTE_240": TransferFunction(smpte240m_to_linear, smpte240m_from_linear, 0.18),
-    "LINEAR": TransferFunction(identity_to_linear, identity_from_linear, 0.50),
-    "LOG_100": TransferFunction(log100_to_linear, log100_from_linear, 0.18),
-    "LOG_100_SQRT10": TransferFunction(
-        log100_sqrt10_to_linear, log100_sqrt10_from_linear, 0.18
+# Official ITU-T H.273 / CICP Video Container Transfer Functions (excluding monitor EOTFs)
+CONTAINER_TFS = {
+    "BT_709": TransferFunction(bt601_to_linear, bt601_from_linear, 0.18, bt601_derivative),
+    "BT_2020_10_BIT (SDR)": TransferFunction(
+        bt601_to_linear, bt601_from_linear, 0.18, bt601_derivative
     ),
-    "IEC_61966": TransferFunction(iec61966_to_linear, iec61966_from_linear, 0.18),
-    "BT_1361": TransferFunction(bt1361_to_linear, bt1361_from_linear, 0.18),
-    "SMPTE_428": TransferFunction(smpte428_to_linear, smpte428_from_linear, 0.18),
-    "SMPTE_2084": TransferFunction(pq_to_linear, pq_from_linear, 26.0 / 10000.0),  # PQ
-    "HLG": TransferFunction(hlg_to_linear, hlg_from_linear, 26.0 / 1000.0),
-    # Standard aliases
-    "BT_709": TransferFunction(bt601_to_linear, bt601_from_linear, 0.18),
-    "BT_1886": TransferFunction(gamma24_to_linear, gamma24_from_linear, 0.18),
-    "BT_2020_10_BIT (SDR)": TransferFunction(bt601_to_linear, bt601_from_linear, 0.18),
-    "BT_2020_12_BIT (SDR)": TransferFunction(bt601_to_linear, bt601_from_linear, 0.18),
-    "UNSPECIFIED": TransferFunction(srgb_to_linear, srgb_from_linear, 0.18),
-    "BT_470_M": TransferFunction(gamma22_to_linear, gamma22_from_linear, 0.18),
-    "BT_470_B_G": TransferFunction(gamma28_to_linear, gamma28_from_linear, 0.18),
+    "BT_2020_12_BIT (SDR)": TransferFunction(
+        bt601_to_linear, bt601_from_linear, 0.18, bt601_derivative
+    ),
+    "SMPTE_2084": TransferFunction(
+        pq_to_linear, pq_from_linear, 26.0 / 10000.0, pq_derivative
+    ),
+    "HLG": TransferFunction(
+        hlg_to_linear, hlg_from_linear, HLG_MID_TONE, hlg_derivative
+    ),
+    "SRGB": TransferFunction(srgb_to_linear, srgb_from_linear, 0.18, srgb_derivative),
+    "BT_601": TransferFunction(bt601_to_linear, bt601_from_linear, 0.18, bt601_derivative),
+    "SMPTE_240": TransferFunction(
+        smpte240m_to_linear, smpte240m_from_linear, 0.18, smpte240m_derivative
+    ),
+    "LINEAR": TransferFunction(
+        identity_to_linear, identity_from_linear, 0.50, identity_derivative
+    ),
+    "LOG_100": TransferFunction(
+        log100_to_linear, log100_from_linear, 0.18, log100_derivative
+    ),
+    "LOG_100_SQRT10": TransferFunction(
+        log100_sqrt10_to_linear,
+        log100_sqrt10_from_linear,
+        0.18,
+        log100_sqrt10_derivative,
+    ),
+    "IEC_61966": TransferFunction(
+        iec61966_to_linear, iec61966_from_linear, 0.18, bt601_derivative
+    ),
+    "BT_1361": TransferFunction(
+        bt1361_to_linear, bt1361_from_linear, 0.18, bt601_derivative
+    ),
 }
 
+# Alias for backward compatibility
+TFS = CONTAINER_TFS
 
-def _lerp(y0: float, y1: float, x0: int, x1: int, x: int) -> float:
-    if x1 == x0:
-        return float(y0)
-    return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
-
-
-def interpolate_scaling(xs: list[int], ys: list[int], luma: int) -> float:
-    """Piecewise-linear scaling curve interpolation at arbitrary luma value."""
-    if not xs:
-        return 0.0
-    if luma <= xs[0]:
-        return float(ys[0])
-    if luma >= xs[-1]:
-        return float(ys[-1])
-    for i in range(len(xs) - 1):
-        if xs[i] <= luma <= xs[i + 1]:
-            return _lerp(ys[i], ys[i + 1], xs[i], xs[i + 1], luma)
-    return 0.0
-
-
-def build_scaling_lut(xs: list[int], ys: list[int]) -> list[int]:
-    """Build the 256-entry integer ScalingLut as defined in AFGS1 spec section 8.2.4."""
-    lut: list[int] = [0] * 256
-    if not xs or not ys:
-        return lut
-
-    num_points = len(xs)
-    for i in range(xs[0]):
-        lut[i] = ys[0]
-
-    for i in range(num_points - 1):
-        x0, y0 = xs[i], ys[i]
-        x1, y1 = xs[i + 1], ys[i + 1]
-        delta_x = x1 - x0
-        delta_y = y1 - y0
-        if delta_x <= 0:
-            continue
-        delta = delta_y * ((65536 + (delta_x >> 1)) // delta_x)
-        for x in range(delta_x):
-            lut[x0 + x] = y0 + ((x * delta + 32768) >> 16)
-
-    for i in range(xs[-1], 256):
-        lut[i] = ys[-1]
-
-    return lut
-
-
-def compute_safe_anti_clipping_envelope(
-    luma_min: int = -60,
-    luma_max: int = 60,
-    scaling_shift: int = 8,
-    grain_scale_shift: int = 0,
-    is_full_range: bool = False,
-    is_chroma: bool = False,
-) -> list[float]:
-    total_shift = scaling_shift + grain_scale_shift
-    divisor = 1 << total_shift
-
-    abs_min = abs(luma_min) if luma_min != 0 else 1
-    abs_max = abs(luma_max) if luma_max != 0 else 1
-
-    l_min = 0 if is_full_range else 16
-    l_max = 255 if is_full_range else (240 if is_chroma else 235)
-
-    safe_envelope = [0.0] * 256
-    for x in range(256):
-        if x <= l_min or x >= l_max:
-            safe_envelope[x] = 0.0
-        else:
-            y_black = ((x - l_min) * divisor) / abs_min
-            y_white = ((l_max - x) * divisor) / abs_max
-            safe_envelope[x] = max(0.0, min(255.0, y_black, y_white))
-
-    return safe_envelope
+# Official Scene-Referred Authoring & Camera Log Working Spaces
+AUTHORING_TFS = {
+    "NONE": None,
+    "ARRI_LOGC3": TransferFunction(
+        logc3_to_linear,
+        logc3_from_linear,
+        0.18,
+        logc3_derivative,
+        max_linear=logc3_to_linear(1.0),
+        label="ARRI LogC3 (EI 800)",
+    ),
+    "ARRI_LOGC4": TransferFunction(
+        logc4_to_linear,
+        logc4_from_linear,
+        0.18,
+        logc4_derivative,
+        max_linear=logc4_to_linear(1.0),
+        label="ARRI LogC4 (ALEXA 35)",
+    ),
+    "ACESCCT": TransferFunction(
+        acescct_to_linear,
+        acescct_from_linear,
+        0.18,
+        acescct_derivative,
+        max_linear=acescct_to_linear(1.0),
+        label="ACEScct (SMPTE S-2016)",
+    ),
+    "DAVINCI_INTERMEDIATE": TransferFunction(
+        davinci_intermediate_to_linear,
+        davinci_intermediate_from_linear,
+        0.18,
+        davinci_intermediate_derivative,
+        max_linear=davinci_intermediate_to_linear(1.0),
+        label="DaVinci Intermediate",
+    ),
+    "SONY_SLOG3": TransferFunction(
+        slog3_to_linear,
+        slog3_from_linear,
+        0.18,
+        slog3_derivative,
+        max_linear=slog3_to_linear(1.0),
+        label="Sony S-Log3",
+    ),
+    "RED_LOG3G10": TransferFunction(
+        log3g10_to_linear,
+        log3g10_from_linear,
+        0.18,
+        log3g10_derivative,
+        max_linear=log3g10_to_linear(1.0),
+        label="RED Log3G10 (IPP2)",
+    ),
+}
 
 
 class _FilmFormatsDict(dict):
@@ -488,74 +672,98 @@ def _build_scale_line(
     return f"\t{prefix} {pts} " + " ".join(flat_pairs) + "\n"
 
 
+def fit_tangent_pwl(
+    dense_x: list[int],
+    dense_y: list[float],
+    max_pts: int = 14,
+    tol: float = 0.15,
+    min_dx: int = 1,
+) -> list[tuple[int, int]]:
+    n = len(dense_x)
+    if n <= 2:
+        return [(dense_x[i], int(round(dense_y[i]))) for i in range(n)]
+
+    selected_indices = [0, n - 1]
+
+    def get_seg_split(i0, i1):
+        x0, y0 = dense_x[i0], dense_y[i0]
+        x1, y1 = dense_x[i1], dense_y[i1]
+        dx = x1 - x0
+        if dx < 2 * min_dx:
+            return 0.0, None
+
+        max_dev = 0.0
+        best_k = None
+        for k in range(i0 + 1, i1):
+            xk = dense_x[k]
+            if (xk - x0) < min_dx or (x1 - xk) < min_dx:
+                continue
+            y_chord = y0 + (y1 - y0) * (xk - x0) / float(dx)
+            dev = abs(dense_y[k] - y_chord)
+            if dev > max_dev:
+                max_dev = dev
+                best_k = k
+        return max_dev, best_k
+
+    while len(selected_indices) < max_pts:
+        worst_dev = 0.0
+        worst_k = None
+        worst_seg_idx = None
+
+        for s_idx in range(len(selected_indices) - 1):
+            i0 = selected_indices[s_idx]
+            i1 = selected_indices[s_idx + 1]
+            dev, k = get_seg_split(i0, i1)
+            if k is not None and dev > worst_dev:
+                worst_dev = dev
+                worst_k = k
+                worst_seg_idx = s_idx
+
+        if worst_k is None or worst_dev <= tol:
+            break
+
+        selected_indices.insert(worst_seg_idx + 1, worst_k)
+
+    return [(dense_x[i], int(round(dense_y[i]))) for i in selected_indices]
+
+
 class PhotonNoiseGenerator:
     def __init__(
         self,
         width,
         height,
         iso_setting,
-        tc_name="SRGB",
+        tc_name="BT_709",
         color_range="LIMITED",
         chroma_scaling=0,
         film_format="35mm",
+        authoring_tc_name="NONE",
+        authoring_strength=0.0,
+        drt_rolloff=None,
     ):
         self.width = width
         self.height = height
         self.iso_setting = iso_setting
-        self.tf = TFS.get(str(tc_name).upper().strip(), TFS["SRGB"])
+        self.tf = CONTAINER_TFS.get(str(tc_name).upper().strip(), CONTAINER_TFS["BT_709"])
         self.color_range = str(color_range).upper().strip()
         self.chroma_scaling = int(chroma_scaling)
         self.film_format = str(film_format).lower().strip().replace("_", " ")
 
-    def _eval_noise_at_x(
-        self,
-        x_norm,
-        max_electrons_per_pixel,
-        input_referred_read_noise,
-        photo_response_non_uniformity,
-        val_range,
-    ):
-        linear = min(1.0, max(0.0, self.tf.to_linear(x_norm)))
-        electrons_per_pixel = max_electrons_per_pixel * linear
-
-        noise_in_electrons = math.sqrt(
-            input_referred_read_noise**2
-            + electrons_per_pixel
-            + (photo_response_non_uniformity**2 * electrons_per_pixel**2)
+        auth_key = str(authoring_tc_name or "NONE").upper().strip()
+        self.authoring_tf = AUTHORING_TFS.get(auth_key)
+        self.authoring_strength = (
+            min(1.0, max(0.0, float(authoring_strength)))
+            if self.authoring_tf is not None
+            else 0.0
         )
-
-        linear_noise = noise_in_electrons / max_electrons_per_pixel
-        linear_range_start = max(0.0, linear - 2.0 * linear_noise)
-        linear_range_end = min(1.0, linear + 2.0 * linear_noise)
-
-        slope_denom = linear_range_end - linear_range_start
-        if slope_denom > 1e-12:
-            tf_slope = (
-                self.tf.from_linear(linear_range_end)
-                - self.tf.from_linear(linear_range_start)
-            ) / slope_denom
+        if drt_rolloff is None:
+            self.drt_rolloff = 0.20 * self.authoring_strength
         else:
-            tf_slope = 0.0
+            self.drt_rolloff = min(0.50, max(0.0, float(drt_rolloff)))
 
-        encoded_noise = linear_noise * tf_slope
-        return min(255.0, val_range * 7.88 * encoded_noise)
+        self._del_x_mid = max(1e-6, min(1.0 - 1e-6, self.tf.from_linear(self.tf.mid_tone)))
 
-    def generate_points(
-        self,
-        num_points=None,
-        ramp_low=3,
-        ramp_high=3,
-        safe_envelope=None,
-        is_chroma=False,
-        chroma_gain=1.0,
-    ):
-        max_allowed_pts = 10 if is_chroma else 14
-        if num_points is None:
-            num_points = max_allowed_pts
-        num_points = max(4, min(max_allowed_pts, int(num_points)))
-
-        photons_per_lxs_per_um2 = 11260.0
-
+    def _compute_sensor_params(self):
         fmt = FILM_FORMATS.get(self.film_format, FILM_FORMATS["35mm"])
         (
             sensor_w,
@@ -567,14 +775,162 @@ class PhotonNoiseGenerator:
 
         mid_tone_exposure = 10.0 / self.iso_setting
         pixel_area_um2 = (sensor_w * sensor_h) / (self.width * self.height)
-
         mid_tone_electrons_per_pixel = (
             effective_quantum_efficiency
-            * photons_per_lxs_per_um2
+            * 11260.0
             * mid_tone_exposure
             * pixel_area_um2
         )
-        max_electrons_per_pixel = mid_tone_electrons_per_pixel / self.tf.mid_tone
+        return (
+            mid_tone_electrons_per_pixel,
+            input_referred_read_noise,
+            photo_response_non_uniformity,
+        )
+
+    def _eval_noise_at_x(
+        self,
+        x_norm,
+        mid_tone_electrons_per_pixel,
+        input_referred_read_noise,
+        photo_response_non_uniformity,
+        val_range,
+    ):
+        L_del = min(1.0, max(0.0, self.tf.to_linear(x_norm)))
+        r_del = L_del / max(1e-12, self.tf.mid_tone)
+
+        auth_tf = self.authoring_tf
+        w_auth = self.authoring_strength if auth_tf is not None else 0.0
+
+        # Smooth EMVA 1288 sensor full-well saturation clamp for authoring dynamic range limits
+        if w_auth > 1e-9 and auth_tf is not None:
+            r_max_auth = max(1.0, auth_tf.max_linear / max(1e-12, auth_tf.mid_tone))
+            ratio = min(50.0, r_del / r_max_auth)
+            r_eff = (1.0 - w_auth) * r_del + w_auth * (r_max_auth * math.tanh(ratio))
+            sech2_r = 1.0 / (math.cosh(ratio) ** 2)
+            sech2_mid = 1.0 / (math.cosh(1.0 / r_max_auth) ** 2)
+            d_sat = (1.0 - w_auth) + w_auth * (sech2_r / sech2_mid)
+        else:
+            r_eff = r_del
+            d_sat = 1.0
+
+        electrons_per_pixel = mid_tone_electrons_per_pixel * r_eff
+        noise_in_electrons = math.sqrt(
+            input_referred_read_noise**2
+            + electrons_per_pixel
+            + (photo_response_non_uniformity**2 * electrons_per_pixel**2)
+        )
+        sigma_rel_mid = noise_in_electrons / max(1e-15, mid_tone_electrons_per_pixel)
+        if sigma_rel_mid <= 1e-15:
+            return 0.0
+
+        sigma_lin_del = sigma_rel_mid * self.tf.mid_tone
+        L_eff_del = min(1.0, math.hypot(L_del, 1.7 * sigma_lin_del))
+        if self.tf.derivative is not None:
+            j_del = self.tf.derivative(L_eff_del)
+        else:
+            h = max(1e-7, min(sigma_lin_del, 0.01))
+            l_hi = min(1.0, L_eff_del + h)
+            l_lo = max(0.0, L_eff_del - h)
+            denom = l_hi - l_lo
+            j_del = (
+                (self.tf.from_linear(l_hi) - self.tf.from_linear(l_lo)) / denom
+                if denom > 1e-12
+                else 0.0
+            )
+        G_del = self.tf.mid_tone * max(0.0, j_del)
+
+        if w_auth > 1e-9 and auth_tf is not None and auth_tf.derivative is not None:
+            sigma_lin_auth = sigma_rel_mid * auth_tf.mid_tone
+            L_scene_eff = math.hypot(auth_tf.mid_tone * r_eff, 1.7 * sigma_lin_auth)
+            j_auth = auth_tf.derivative(L_scene_eff)
+            G_auth = max(1e-12, auth_tf.mid_tone * j_auth * d_sat)
+            G_del_safe = max(1e-12, G_del)
+            blended_gain = (G_auth**w_auth) * (G_del_safe ** (1.0 - w_auth))
+        else:
+            blended_gain = G_del
+
+        if self.drt_rolloff > 1e-9:
+            x_mid = self._del_x_mid
+            if x_norm < x_mid:
+                d_mid = (x_mid - x_norm) / max(1e-9, x_mid)
+            else:
+                d_mid = (x_norm - x_mid) / max(1e-9, 1.0 - x_mid)
+            drt_window = max(0.0, 1.0 - self.drt_rolloff * (d_mid * d_mid))
+        else:
+            drt_window = 1.0
+
+        encoded_noise = sigma_rel_mid * blended_gain * drt_window
+        return min(255.0, max(0.0, val_range * 7.88 * encoded_noise))
+
+    def get_theoretical_noise_curve(
+        self,
+        dense_x=None,
+        chroma_gain=1.0,
+        num_points=3000,
+        is_chroma=False,
+    ):
+        """Return (xs, ys) of the theoretical continuous photon noise curve in 0..255."""
+        (
+            mid_tone_electrons_per_pixel,
+            input_referred_read_noise,
+            photo_response_non_uniformity,
+        ) = self._compute_sensor_params()
+
+        min_val = 16.0 if self.color_range == "LIMITED" else 0.0
+        max_val = (
+            255.0
+            if self.color_range != "LIMITED"
+            else (240.0 if is_chroma else 235.0)
+        )
+        val_range = max(1e-6, max_val - min_val)
+
+        if dense_x is None:
+            num_samples = max(2000, num_points)
+            step = val_range / float(num_samples - 1)
+            dense_x = [min_val + i * step for i in range(num_samples)]
+            dense_x[0] = min_val
+            dense_x[-1] = max_val
+
+        xs = []
+        ys = []
+        for x in dense_x:
+            x_norm = max(0.0, min(1.0, (x - min_val) / float(val_range)))
+            y_phys = (
+                self._eval_noise_at_x(
+                    x_norm,
+                    mid_tone_electrons_per_pixel,
+                    input_referred_read_noise,
+                    photo_response_non_uniformity,
+                    val_range,
+                )
+                * chroma_gain
+            )
+            xs.append(x)
+            ys.append(min(255.0, max(0.0, y_phys)))
+        if xs:
+            xs[0] = min_val
+            xs[-1] = max_val
+        return xs, ys
+
+    def generate_points(
+        self,
+        num_points=None,
+        ramp_low=1,
+        ramp_high=1,
+        safe_envelope=None,
+        is_chroma=False,
+        chroma_gain=1.0,
+    ):
+        max_allowed_pts = 10 if is_chroma else 14
+        if num_points is None:
+            num_points = max_allowed_pts
+        num_points = max(2, min(max_allowed_pts, int(num_points)))
+
+        (
+            mid_tone_electrons_per_pixel,
+            input_referred_read_noise,
+            photo_response_non_uniformity,
+        ) = self._compute_sensor_params()
 
         if self.color_range == "LIMITED":
             min_value = 16
@@ -584,135 +940,57 @@ class PhotonNoiseGenerator:
             max_value = 255
         val_range = max_value - min_value
 
-        if safe_envelope is not None:
-            # When a full 256-entry anti-clipping envelope is provided, evaluate across
-            # the entire [min_value, max_value] domain with hard 0 anchors at the ends.
-            # This allows the PWL decimator to automatically place a single node right at
-            # the intersection knee between the linear envelope and the physical noise curve.
-            dense_x = list(range(min_value, max_value + 1))
-            dense_y = []
-            for x in dense_x:
-                if x == min_value or x == max_value:
-                    dense_y.append(0.0)
-                else:
-                    y_phys = (
-                        self._eval_noise_at_x(
-                            (x - min_value) / float(val_range),
-                            max_electrons_per_pixel,
-                            input_referred_read_noise,
-                            photo_response_non_uniformity,
-                            val_range,
-                        )
-                        * chroma_gain
-                    )
-                    y_phys = min(255.0, max(0.0, y_phys))
-                    if x < len(safe_envelope):
-                        y_phys = min(y_phys, float(safe_envelope[x]))
-                    dense_y.append(y_phys)
-            target_count = min(num_points, len(dense_x))
-        else:
-            x_start = min_value + max(1, int(ramp_low))
-            x_end = max_value - max(1, int(ramp_high))
-            if x_start >= x_end:
-                x_start = min_value + 1
-                x_end = max_value - 1
+        x_start = min_value + max(1, int(ramp_low))
+        x_end = max_value - max(1, int(ramp_high))
+        if x_start >= x_end:
+            x_start = min_value + 1
+            x_end = max_value - 1
 
-            dense_x = list(range(x_start, x_end + 1))
-            dense_y = [
-                min(
-                    255.0,
-                    max(
-                        0.0,
-                        self._eval_noise_at_x(
-                            (x - min_value) / float(val_range),
-                            max_electrons_per_pixel,
-                            input_referred_read_noise,
-                            photo_response_non_uniformity,
-                            val_range,
-                        )
-                        * chroma_gain,
-                    ),
+        dense_x = list(range(x_start, x_end + 1))
+        dense_y = []
+        for x in dense_x:
+            y_phys = (
+                self._eval_noise_at_x(
+                    (x - min_value) / float(val_range),
+                    mid_tone_electrons_per_pixel,
+                    input_referred_read_noise,
+                    photo_response_non_uniformity,
+                    val_range,
                 )
-                for x in dense_x
-            ]
-            target_count = max(2, min(num_points - 2, len(dense_x)))
-
-        dense_y_int = [int(round(y)) for y in dense_y]
-        active_indices = list(range(len(dense_x)))
-
-        def segment_sse(idx_l, idx_r):
-            x0, y0_int = dense_x[idx_l], dense_y_int[idx_l]
-            x1, y1_int = dense_x[idx_r], dense_y_int[idx_r]
-            y0_f, y1_f = dense_y[idx_l], dense_y[idx_r]
-            dx = x1 - x0
-            if dx <= 0:
-                return 0.0
-            dy_int = y1_int - y0_int
-            delta = dy_int * ((65536 + (dx >> 1)) // dx)
-            slope_f = (y1_f - y0_f) / dx
-            sse = 0.0
-            for k in range(idx_l + 1, idx_r):
-                offset_x = dense_x[k] - x0
-                # Exact integer ScalingLut value reconstructed by the AV1 decoder (AFGS1 8.2.4)
-                lut_val = y0_int + ((offset_x * delta + 32768) >> 16)
-                interp_f = y0_f + offset_x * slope_f
-                err_lut = dense_y_int[k] - lut_val
-                err_f = dense_y[k] - interp_f
-                sse += err_lut * err_lut + 0.25 * (err_f * err_f)
-            return sse
-
-        def removal_cost(pos):
-            idx_prev = active_indices[pos - 1]
-            idx_curr = active_indices[pos]
-            idx_next = active_indices[pos + 1]
-            delta = segment_sse(idx_prev, idx_next) - (
-                segment_sse(idx_prev, idx_curr) + segment_sse(idx_curr, idx_next)
+                * chroma_gain
             )
-            return max(0.0, delta)
+            y_phys = min(255.0, max(0.0, y_phys))
+            if safe_envelope is not None and x < len(safe_envelope):
+                y_phys = min(y_phys, float(safe_envelope[x]))
+            dense_y.append(y_phys)
 
-        costs = [0.0] * len(active_indices)
-        for p in range(1, len(active_indices) - 1):
-            costs[p] = removal_cost(p)
+        mid_pts = fit_tangent_pwl(
+            dense_x, dense_y, max_pts=max(2, num_points - 2), tol=0.15, min_dx=1
+        )
+        scaling_points = [(min_value, 0)] + mid_pts + [(max_value, 0)]
 
-        while len(active_indices) > target_count and len(active_indices) > 2:
-            best_p = min(
-                range(1, len(active_indices) - 1),
-                key=lambda p: (
-                    round(costs[p], 9),
-                    dense_x[active_indices[p + 1]] - dense_x[active_indices[p - 1]],
-                ),
-            )
-            active_indices.pop(best_p)
-            costs.pop(best_p)
+        cleaned = []
+        seen_x = set()
+        for x, y in sorted(scaling_points, key=lambda pt: pt[0]):
+            cx = max(min_value, min(max_value, int(x)))
+            cy = max(0, min(255, int(y)))
+            if cx not in seen_x:
+                seen_x.add(cx)
+                cleaned.append((cx, cy))
 
-            if best_p - 1 >= 1:
-                costs[best_p - 1] = removal_cost(best_p - 1)
-            if best_p < len(active_indices) - 1:
-                costs[best_p] = removal_cost(best_p)
+        if len(cleaned) > max_allowed_pts:
+            cleaned = cleaned[: max_allowed_pts - 1] + [cleaned[-1]]
 
-        if safe_envelope is not None:
-            scaling_points = [
-                (dense_x[idx], dense_y_int[idx]) for idx in active_indices
-            ]
-            scaling_points[0] = (min_value, 0)
-            scaling_points[-1] = (max_value, 0)
-        else:
-            scaling_points = [(min_value, 0)]
-            for idx in active_indices:
-                scaling_points.append((dense_x[idx], dense_y_int[idx]))
-            scaling_points.append((max_value, 0))
-
-        return scaling_points
+        return cleaned
 
     def generate_chroma_points(
         self,
         num_points=10,
-        ramp_low=3,
-        ramp_high=3,
+        ramp_low=1,
+        ramp_high=1,
         safe_envelope=None,
         chroma_gain=1.0,
     ):
-        """Generate up to 10 scaling points for chroma planes (sCb / sCr)."""
         return self.generate_points(
             num_points=num_points,
             ramp_low=ramp_low,
@@ -725,8 +1003,8 @@ class PhotonNoiseGenerator:
     def generate(
         self,
         num_points=14,
-        ramp_low=3,
-        ramp_high=3,
+        ramp_low=1,
+        ramp_high=1,
         safe_envelope=None,
         seed=7391,
         duration_ticks=10000000,
@@ -838,6 +1116,29 @@ if __name__ == "__main__":
         default="35mm",
         help="Lens type / film format (e.g. 35mm, super35, 'ARRI Alexa 65')",
     )
+    parser.add_argument(
+        "-a",
+        "--authoring-transfer",
+        type=str,
+        default="NONE",
+        choices=list(AUTHORING_TFS.keys()),
+        help="Camera / DI authoring Log working space (default: NONE = Direct Container Transfer)",
+    )
+    parser.add_argument(
+        "-m",
+        "--authoring-strength",
+        "--authoring-mix",
+        dest="authoring_strength",
+        type=float,
+        default=0.0,
+        help="Authoring Log influence in [0.0, 1.0] (0=Direct, 0.5=Hybrid, 1.0=Pure Log)",
+    )
+    parser.add_argument(
+        "--drt-rolloff",
+        type=float,
+        default=None,
+        help="DRT Toe/Clip roll-off in [0.0, 0.5] (default: adaptive 0.20 * authoring-strength)",
+    )
 
     parser.add_argument(
         "-c",
@@ -891,6 +1192,9 @@ if __name__ == "__main__":
         color_range=args.range,
         chroma_scaling=args.chroma_scaling,
         film_format=args.lens,
+        authoring_tc_name=args.authoring_transfer,
+        authoring_strength=args.authoring_strength,
+        drt_rolloff=args.drt_rolloff,
     )
 
     sys.stdout.write(

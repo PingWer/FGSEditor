@@ -1,10 +1,14 @@
 import sys
 import os
 import pathlib
+import multiprocessing
 
 _root = pathlib.Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QPalette, QColor, QIcon
@@ -176,8 +180,8 @@ def setup_dark_theme(app: QApplication):
 
 
 def main():
-    import multiprocessing
     multiprocessing.freeze_support()
+    from fgseditor_qt import __version__
 
     if sys.platform.startswith("linux"):
         # Suppress noisy upstream QtWayland textinput v3 disableSurface warning spam
@@ -194,12 +198,16 @@ def main():
         import ctypes
 
         try:
-            myappid = "PingWer.fgseditor.5.1.1"
+            myappid = f"PingWer.fgseditor.{__version__}"
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except Exception:
             pass
 
     app = QApplication(sys.argv)
+    app.setApplicationName("FGSEditor")
+    app.setApplicationVersion(__version__)
+    if sys.platform.startswith("linux"):
+        app.setDesktopFileName("fgseditor")
 
     if sys.platform.startswith("linux"):
         QLoggingCategory.setFilterRules(

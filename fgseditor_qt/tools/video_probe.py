@@ -122,7 +122,18 @@ def probe_video(filepath: str) -> dict:
 
     codec = (video_stream.get("codec_name") or "").lower()
     pix_fmt = (video_stream.get("pix_fmt") or "").lower()
+    color_range = (video_stream.get("color_range") or "").strip().lower()
     is_444 = "444" in pix_fmt
+
+    bits = _safe_int(video_stream.get("bits_per_raw_sample"), 0)
+    if bits in (8, 10, 12):
+        bit_depth = bits
+    elif "10" in pix_fmt:
+        bit_depth = 10
+    elif "12" in pix_fmt:
+        bit_depth = 12
+    else:
+        bit_depth = 8
 
     width = _safe_int(video_stream.get("width"), 0)
     height = _safe_int(video_stream.get("height"), 0)
@@ -136,7 +147,9 @@ def probe_video(filepath: str) -> dict:
     return {
         "codec": codec,
         "pix_fmt": pix_fmt,
+        "color_range": color_range,
         "is_444": is_444,
+        "bit_depth": bit_depth,
         "width": width,
         "height": height,
         "fps": fps,

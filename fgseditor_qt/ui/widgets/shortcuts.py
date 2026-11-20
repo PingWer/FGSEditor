@@ -1,7 +1,8 @@
 SHORTCUTS = [
     ("Left Click + Drag", "Move point", ""),
     ("Left Click + Shift", "Lock axis", ""),
-    ("Double Left Click", "Edit point", ""),
+    ("Double Left Click", "Edit point", " — In Event Editor Only"),
+    ("Double Left Click", "Edit event (when labels visible)", " — In Timeline Editor Only"),
     ("Right Click", "Add / Remove point", ""),
     ("Middle Click + Drag", "Pan", " — In Event Editor Only"),
     ("Right Click + Drag", "Pan", " — In Timeline Editor Only"),
@@ -83,11 +84,12 @@ def show_shortcuts(parent=None):
 
 def show_credits(parent=None):
     from PySide6.QtWidgets import QMessageBox
+    from fgseditor_qt import __version__
 
     msg = QMessageBox(parent)
     msg.setWindowTitle(" ")
     msg.setText(
-        "FGSEditor v5.1.0\n\n"
+        f"FGSEditor v{__version__}\n\n"
         'Copyright \u00a9 2026 Michele "PingWer" Cosentino\n\n'
         'Collaborators:\nManuel "Mhanz3500" Moscardi'
     )
@@ -99,6 +101,7 @@ def show_notice(parent=None):
     from PySide6.QtWidgets import QDialog, QVBoxLayout, QPushButton, QLabel
     from PySide6.QtCore import Qt
     import os
+    import sys
     from fgseditor_qt.core.app_paths import get_base_dir
 
     dialog = QDialog(parent)
@@ -122,6 +125,10 @@ def show_notice(parent=None):
     )
 
     notice_path = os.path.join(get_base_dir(), "NOTICE.md")
+    if not os.path.exists(notice_path) and hasattr(sys, "_MEIPASS"):
+        meipass_notice = os.path.join(sys._MEIPASS, "NOTICE.md")
+        if os.path.exists(meipass_notice):
+            notice_path = meipass_notice
     if os.path.exists(notice_path):
         try:
             with open(notice_path, "r", encoding="utf-8") as f:

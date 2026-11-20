@@ -239,26 +239,27 @@ class PanelTime(QWidget):
             min_f = int(min(MAX_QT_INT, ticks_to_frames(self._min_allowed_ticks, fps)))
             max_f = int(min(MAX_QT_INT, ticks_to_frames(self._max_allowed_ticks, fps)))
 
-            self._start_frame.setRange(min_f, max(min_f, max_f - 1))
-            self._start_frame.setValue(
-                int(min(max_f, ticks_to_frames(self._start_ticks, fps)))
-            )
+            sf = int(min(max_f, max(min_f, ticks_to_frames(self._start_ticks, fps))))
+            ef = int(min(max_f, max(sf + 1, ticks_to_frames(self._end_ticks, fps))))
+
+            self._start_frame.setRange(min_f, max(min_f, ef - 1))
+            self._start_frame.setValue(sf)
 
             self._end_frame.setRange(
-                max(min_f + 1, self._start_frame.value() + 1), max_f
+                max(min_f + 1, sf + 1), max(min_f + 1, max_f)
             )
-            self._end_frame.setValue(
-                int(min(max_f, ticks_to_frames(self._end_ticks, fps)))
-            )
+            self._end_frame.setValue(ef)
 
         min_s = min(float(MAX_QT_INT), ticks_to_seconds(self._min_allowed_ticks))
         max_s = min(float(MAX_QT_INT), ticks_to_seconds(self._max_allowed_ticks))
-        self._start_sec.setRange(min_s, max(min_s, max_s - 0.0001))
-        self._start_sec.setValue(min(max_s, ticks_to_seconds(self._start_ticks)))
+        ss = min(max_s, max(min_s, ticks_to_seconds(self._start_ticks)))
+        es = min(max_s, max(ss + 0.0001, ticks_to_seconds(self._end_ticks)))
+        self._start_sec.setRange(min_s, max(min_s, es - 0.0001))
+        self._start_sec.setValue(ss)
         self._end_sec.setRange(
-            max(min_s + 0.0001, self._start_sec.value() + 0.0001), max_s
+            max(min_s + 0.0001, ss + 0.0001), max(min_s + 0.0001, max_s)
         )
-        self._end_sec.setValue(min(max_s, ticks_to_seconds(self._end_ticks)))
+        self._end_sec.setValue(es)
 
         self._start_tc.setText(ticks_to_timecode(self._start_ticks))
         self._end_tc.setText(ticks_to_timecode(self._end_ticks))
@@ -298,8 +299,12 @@ class PanelTime(QWidget):
             return
         if checked and self._video_info:
             fps = self._current_fps()
-            self._start_ticks = 0
-            self._end_ticks = video_info_to_ticks(self._video_info, fps=fps)
+            vid_t = video_info_to_ticks(self._video_info, fps=fps)
+            self._start_ticks = self._min_allowed_ticks
+            self._end_ticks = max(
+                self._start_ticks + 1,
+                min(self._max_allowed_ticks, vid_t if vid_t > 0 else self._max_allowed_ticks),
+            )
             self._sync_widgets_from_ticks()
             self._emit_change()
 
@@ -308,7 +313,11 @@ class PanelTime(QWidget):
             return
         fps = self._current_fps()
         if fps > 0:
-            self._start_ticks = frames_to_ticks(val, fps)
+            if val == ticks_to_frames(self._min_allowed_ticks, fps):
+                t = self._min_allowed_ticks
+            else:
+                t = frames_to_ticks(val, fps)
+            self._start_ticks = max(self._min_allowed_ticks, min(self._end_ticks - 1, t))
             self._sync_widgets_from_ticks()
             self._emit_change()
 
@@ -317,21 +326,27 @@ class PanelTime(QWidget):
             return
         fps = self._current_fps()
         if fps > 0:
-            self._end_ticks = frames_to_ticks(val, fps)
+            if val == ticks_to_frames(self._max_allowed_ticks, fps):
+                t = self._max_allowed_ticks
+            else:
+                t = frames_to_ticks(val, fps)
+            self._end_ticks = max(self._start_ticks + 1, min(self._max_allowed_ticks, t))
             self._sync_widgets_from_ticks()
             self._emit_change()
 
     def _on_sec_start_changed(self, val: float) -> None:
         if self._suppress:
             return
-        self._start_ticks = seconds_to_ticks(val)
+        t = seconds_to_ticks(val)
+        self._start_ticks = max(self._min_allowed_ticks, min(self._end_ticks - 1, t))
         self._sync_widgets_from_ticks()
         self._emit_change()
 
     def _on_sec_end_changed(self, val: float) -> None:
         if self._suppress:
             return
-        self._end_ticks = seconds_to_ticks(val)
+        t = seconds_to_ticks(val)
+        self._end_ticks = max(self._start_ticks + 1, min(self._max_allowed_ticks, t))
         self._sync_widgets_from_ticks()
         self._emit_change()
 
@@ -339,7 +354,7 @@ class PanelTime(QWidget):
         if self._suppress:
             return
         t = timecode_to_ticks(self._start_tc.text())
-        t = max(self._min_allowed_ticks, min(self._max_allowed_ticks - 1, t))
+        t = max(self._min_allowed_ticks, min(self._end_ticks - 1, t))
         self._start_ticks = t
         self._sync_widgets_from_ticks()
         self._emit_change()

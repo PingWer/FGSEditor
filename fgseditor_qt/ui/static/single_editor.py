@@ -58,6 +58,7 @@ class SingleEventEditor(QWidget):
         self.original_scale_data = {}
         self.original_p_params = {}
         self.original_grain_size = "-1"
+        self.original_seed = 7391
         self.original_time_bounds = (0, 0)
         self._ar_windows = {"Y": None, "Cb": None, "Cr": None}
         self.original_ar_coeffs = {"Y": [], "Cb": [], "Cr": []}
@@ -70,6 +71,7 @@ class SingleEventEditor(QWidget):
         self._last_known_state = None
         
         self.fps_callback = None
+        self._video_info = None
 
         self._setup_ui()
 
@@ -176,6 +178,13 @@ class SingleEventEditor(QWidget):
         self.clear_btn.setEnabled(False)
         mid_layout.addWidget(self.clear_btn)
 
+        self.fix_clipping_btn = QPushButton("Fix clipping")
+        self.fix_clipping_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.fix_clipping_btn.setToolTip("Shift points on active channel to prevent clipping")
+        self.fix_clipping_btn.clicked.connect(self.fix_clipping)
+        self.fix_clipping_btn.setEnabled(False)
+        mid_layout.addWidget(self.fix_clipping_btn)
+
         self.save_plot_btn = QPushButton("Save Plot")
         self.save_plot_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.save_plot_btn.clicked.connect(self.save_plot_requested.emit)
@@ -206,13 +215,14 @@ class SingleEventEditor(QWidget):
         layout.addWidget(h_splitter, stretch=1)
 
         self.sidebar = ParamsSidebar()
-        self.tabs_bar.tab_changed.connect(self.sidebar.set_tab)
+        self.tabs_bar.tab_changed.connect(self._on_sidebar_tab_changed)
         self.sidebar.params_changed.connect(self._on_params_changed)
         self.sidebar.grain_size_changed.connect(self._on_grain_size_changed)
         self.sidebar.photon_noise_changed.connect(self._on_photon_noise_changed)
         self.sidebar.template_apply_requested.connect(self._on_template_apply_requested)
         self.sidebar.time_changed.connect(self._on_time_changed)
         self.sidebar.fps_or_mode_changed.connect(self._on_fps_or_mode_changed)
+        self.sidebar.range_mode_changed.connect(self._on_sidebar_range_mode_changed)
         h_splitter.addWidget(self.sidebar)
 
         v_splitter = QSplitter(Qt.Vertical)
@@ -221,6 +231,8 @@ class SingleEventEditor(QWidget):
         h_splitter.addWidget(v_splitter)
 
         self.plotter = InteractiveFGSPlotter()
+        self.sidebar.photon_noise_overlays_changed.connect(self.plotter.set_photon_noise_overlays)
+        self.sidebar.photon_noise_visibility_changed.connect(self.plotter.set_overlay_visibility)
         self.plotter.undo_push_requested.connect(self._on_plotter_undo_push_requested)
         self.plotter.undo_requested.connect(self.undo)
         self.plotter.redo_requested.connect(self.redo)
@@ -242,6 +254,7 @@ class SingleEventEditor(QWidget):
 
         self.original_p_params = self.sidebar.get_p_params()
         self.original_grain_size = self.sidebar.get_grain_size()
+        self.original_seed = self.sidebar.get_seed()
         self.original_time_bounds = self.sidebar.get_event_time_bounds()
 
     def set_has_sanitization_changes(self, changed: bool):
@@ -259,12 +272,14 @@ class SingleEventEditor(QWidget):
             self.current_scale_data = {}
             self.original_p_params = self.sidebar.get_p_params()
             self.original_grain_size = self.sidebar.get_grain_size()
+            self.original_seed = self.sidebar.get_seed()
             self.original_time_bounds = self.sidebar.get_event_time_bounds()
             self.original_ar_coeffs = {"Y": [], "Cb": [], "Cr": []}
             self._has_sanitization_changes = False
             self._is_temp = False
             self.reset_btn.setEnabled(False)
             self.clear_btn.setEnabled(False)
+            self.fix_clipping_btn.setEnabled(False)
             self.plotter.set_data({})
             self._refresh_time_info()
             self._refresh_grain_preview()
@@ -294,6 +309,8 @@ class SingleEventEditor(QWidget):
         self.full_range_cb.setChecked(has_full_range)
         self.full_range_cb.blockSignals(False)
         self.plotter.set_full_range_mode(has_full_range)
+        if self.sidebar:
+            self.sidebar.set_full_range_mode(has_full_range)
         self.plotter.set_data(self.current_scale_data)
 
         if self._working:
@@ -305,6 +322,7 @@ class SingleEventEditor(QWidget):
 
         self.original_p_params = self.sidebar.get_p_params()
         self.original_grain_size = self.sidebar.get_grain_size()
+        self.original_seed = self.sidebar.get_seed()
         self.original_time_bounds = self.sidebar.get_event_time_bounds()
 
         orig_cy, orig_cb, orig_cr = fgs_parser.extract_ar_coeffs_from_raw_lines(
@@ -318,6 +336,7 @@ class SingleEventEditor(QWidget):
 
         self.reset_btn.setEnabled(True)
         self.clear_btn.setEnabled(True)
+        self.fix_clipping_btn.setEnabled(True)
 
         self._refresh_time_info()
         self._refresh_grain_preview()
@@ -338,7 +357,12 @@ class SingleEventEditor(QWidget):
         self._refresh_time_info()
 
     def set_video_info(self, info):
+        self._video_info = info
         self.sidebar.set_video_info(info)
+        if self.plotter and info:
+            b_depth = info.get("bit_depth", 8)
+            self.plotter._clip_bit_depth = b_depth
+            self.plotter.refresh()
 
     def set_file_label(self, text):
         self.file_label.setText(text)
@@ -422,16 +446,47 @@ class SingleEventEditor(QWidget):
         st, et = self.sidebar.get_event_time_bounds()
         self._working["start_time"] = st
         self._working["end_time"] = et
+        extra = list(self._working.get("extra_params") or ["1", "7391", "1"])
+        if len(extra) < 3:
+            defaults = ["1", "7391", "1"]
+            extra.extend(defaults[len(extra) : 3])
+        extra[1] = str(self.sidebar.get_seed())
+        self._working["extra_params"] = extra
+        self._working["e_line"] = f"E {st} {et} {' '.join(extra)}\n"
         return self._working
 
     def apply_working_to_event(self):
         if self.event_dict is not None:
             working = self.get_working_event()
+            extra = working.get("extra_params") or ["1", "7391", "1"]
+            if extra[0] != "0":
+                from fgseditor_qt.core.fgs_save import _build_p_line, _build_scale_line
+
+                p_params = working.get("p_params") or self.sidebar.get_p_params()
+                scale_data = working.get("scale_data") or copy.deepcopy(self.current_scale_data)
+                lag = p_params.get("ar_coeff_lag", 3)
+                chroma_from_luma = p_params.get("chroma_scaling_from_luma", 0) == 1
+                cy_coeffs, cb_coeffs, cr_coeffs = fgs_parser.extract_ar_coeffs_from_raw_lines(
+                    working.get("raw_lines", [])
+                )
+                canonical_raw_lines = [_build_p_line(p_params)]
+                for ch_prefix in ("sY", "sCb", "sCr"):
+                    ch_data = scale_data.get(ch_prefix, {"x": [], "y": []})
+                    canonical_raw_lines.append(
+                        _build_scale_line(ch_prefix, ch_data, chroma_from_luma=chroma_from_luma)
+                    )
+                canonical_raw_lines.append(fgs_parser.format_c_line("cY", cy_coeffs, lag))
+                canonical_raw_lines.append(fgs_parser.format_c_line("cCb", cb_coeffs, lag))
+                canonical_raw_lines.append(fgs_parser.format_c_line("cCr", cr_coeffs, lag))
+                working["raw_lines"] = canonical_raw_lines
+                self._working["raw_lines"] = canonical_raw_lines
+
             self.event_dict.update(working)
             
             self.original_scale_data = copy.deepcopy(self.current_scale_data)
             self.original_p_params = self.sidebar.get_p_params()
             self.original_grain_size = self.sidebar.get_grain_size()
+            self.original_seed = self.sidebar.get_seed()
             self.original_time_bounds = self.sidebar.get_event_time_bounds()
             orig_cy, orig_cb, orig_cr = fgs_parser.extract_ar_coeffs_from_raw_lines(
                 self._working.get("raw_lines", [])
@@ -473,10 +528,24 @@ class SingleEventEditor(QWidget):
     def _on_full_range_toggled(self, checked: bool):
         if self.plotter:
             self.plotter.set_full_range_mode(checked)
+        if self.sidebar:
+            self.sidebar.set_full_range_mode(checked)
+
+    def _on_sidebar_range_mode_changed(self, is_full: bool):
+        if self.full_range_cb.isChecked() != is_full:
+            self.full_range_cb.blockSignals(True)
+            self.full_range_cb.setChecked(is_full)
+            self.full_range_cb.blockSignals(False)
+            if self.plotter:
+                self.plotter.set_full_range_mode(is_full)
 
     def on_channel_change(self, text):
         self.plotter.active_channel = text
         self._update_plot_x_label()
+        if hasattr(self, "sidebar") and self.sidebar:
+            self.sidebar._active_channel = text
+            if hasattr(self.sidebar, "panel_photon") and self.sidebar.panel_photon._pn_enable_chk.isChecked():
+                self.sidebar.recompute_photon_noise_overlays()
         self.plotter.refresh()
 
     def on_plotter_changed(self):
@@ -505,6 +574,14 @@ class SingleEventEditor(QWidget):
                 for ch, d in self.current_scale_data.items()
             }
             self.plotter.refresh()
+
+    def _on_sidebar_tab_changed(self, index: int) -> None:
+        self.sidebar.set_tab(index)
+        is_photon = (index == 2)
+        if self.plotter:
+            self.plotter.set_photon_noise_active(is_photon)
+            if is_photon:
+                self.sidebar.recompute_photon_noise_overlays()
 
     def _on_params_changed(self, p_params: dict):
         self._push_undo_global()
@@ -545,8 +622,17 @@ class SingleEventEditor(QWidget):
         if not self.current_scale_data:
             return
 
-        if (self.current_scale_data["sY"]["x"] == payload["sY"]["x"]
-            and self.current_scale_data["sY"]["y"] == payload["sY"]["y"]):
+        has_chroma_payload = bool(payload.get("sCb", {}).get("x"))
+        if (
+            self.current_scale_data["sY"] == payload["sY"]
+            and (
+                not has_chroma_payload
+                or (
+                    self.current_scale_data["sCb"] == payload["sCb"]
+                    and self.current_scale_data["sCr"] == payload["sCr"]
+                )
+            )
+        ):
             return
 
         self._push_undo_global()
@@ -733,6 +819,8 @@ class SingleEventEditor(QWidget):
             self.full_range_cb.setChecked(True)
             self.full_range_cb.blockSignals(False)
             self.plotter.set_full_range_mode(True)
+            if self.sidebar:
+                self.sidebar.set_full_range_mode(True)
 
     def undo(self):
         if not self._undo_stack or not self._last_known_state:
@@ -747,7 +835,10 @@ class SingleEventEditor(QWidget):
             
             self._sync_full_range_checkbox()
             self.plotter.current_data = copy.deepcopy(self.current_scale_data)
-            self.plotter.refresh()
+            if getattr(self.plotter, "_photon_noise_active", False):
+                self.sidebar.recompute_photon_noise_overlays()
+            else:
+                self.plotter.refresh()
             self._refresh_time_info()
 
         self._preserve_and_apply_ar_coeffs(do_undo)
@@ -765,7 +856,10 @@ class SingleEventEditor(QWidget):
             
             self._sync_full_range_checkbox()
             self.plotter.current_data = copy.deepcopy(self.current_scale_data)
-            self.plotter.refresh()
+            if getattr(self.plotter, "_photon_noise_active", False):
+                self.sidebar.recompute_photon_noise_overlays()
+            else:
+                self.plotter.refresh()
             self._refresh_time_info()
 
         self._preserve_and_apply_ar_coeffs(do_redo)
@@ -792,6 +886,8 @@ class SingleEventEditor(QWidget):
             self.full_range_cb.setChecked(orig_full)
             self.full_range_cb.blockSignals(False)
             self.plotter.set_full_range_mode(orig_full)
+            if self.sidebar:
+                self.sidebar.set_full_range_mode(orig_full)
             self.plotter.current_data = copy.deepcopy(self.current_scale_data)
             self.plotter.refresh()
             self._refresh_grain_preview()
@@ -883,6 +979,118 @@ class SingleEventEditor(QWidget):
             self._update_last_known_state()
             self._update_ui_state()
 
+    def fix_clipping(self) -> None:
+        """Fix clipping on the currently active channel."""
+        ch = self.channel_dropdown.currentText()
+        if not self.current_scale_data or ch not in self.current_scale_data:
+            return
+
+        xs = list(self.current_scale_data[ch].get("x", []))
+        ys = list(self.current_scale_data[ch].get("y", []))
+        n_pts = len(xs)
+        if n_pts == 0 or len(ys) < n_pts:
+            return
+
+        from fgseditor_qt.ui.panels.utils import ask_fix_clipping_options
+
+        proceed, fix_endpoints = ask_fix_clipping_options(self, is_dynamic=False)
+        if not proceed:
+            return
+
+        if not fix_endpoints and n_pts < 3:
+            QMessageBox.information(
+                self,
+                "Fix Clipping",
+                f"No clipping detected on channel {ch}.",
+            )
+            return
+
+        extremes = getattr(self.grain_preview, "_last_extremes", None)
+        if not extremes and self._working:
+            from fgseditor_qt.math import fgs_grain_sim
+            p_params = self.sidebar.get_p_params()
+            cy, cb, cr = fgs_parser.extract_ar_coeffs_from_raw_lines(self._working.get("raw_lines", []))
+            v_info = getattr(self, "_video_info", None) or {}
+            extremes = fgs_grain_sim.compute_grain_extremes(
+                seed=fgs_parser.get_grain_seed(self._working),
+                cy_coeffs=cy,
+                cb_coeffs=cb,
+                cr_coeffs=cr,
+                ar_lag=p_params.get("ar_coeff_lag", 3),
+                ar_shift=p_params.get("ar_coeff_shift", 6),
+                grain_scale_shift=p_params.get("grain_scale_shift", 0),
+                is_444=v_info.get("is_444", False),
+            )
+        if not extremes:
+            QMessageBox.information(
+                self,
+                "Fix Clipping",
+                "Unable to determine grain extremes. Make sure parameters are loaded.",
+            )
+            return
+
+        p_params = self.sidebar.get_p_params()
+        s_shift = fgs_parser.get_scaling_shift({"p_params": p_params})
+        bit_depth = (
+            self._video_info.get("bit_depth", 8)
+            if getattr(self, "_video_info", None)
+            else 8
+        )
+        is_full = self.plotter._full_range_mode if self.plotter else False
+
+        channel_configs = {
+            "sY": ("luma_min", "luma_max"),
+            "sCb": ("cb_min", "cb_max"),
+            "sCr": ("cr_min", "cr_max"),
+        }
+        min_key, max_key = channel_configs.get(ch, ("luma_min", "luma_max"))
+        grain_min = extremes.get(min_key, 0)
+        grain_max = extremes.get(max_key, 0)
+
+        from fgseditor_qt.math.fgs_grain_sim import fix_channel_clipping_points
+        new_xs, new_ys, max_shift = fix_channel_clipping_points(
+            xs,
+            ys,
+            ch,
+            grain_min=grain_min,
+            grain_max=grain_max,
+            scaling_shift=s_shift,
+            bit_depth=bit_depth,
+            is_full_range=is_full,
+            fix_endpoints=fix_endpoints,
+        )
+
+        if new_xs == xs and new_ys == ys:
+            QMessageBox.information(
+                self,
+                "Fix Clipping",
+                f"No clipping detected on channel {ch}.",
+            )
+            return
+
+        if max_shift > 4:
+            reply = QMessageBox.warning(
+                self,
+                "Fix Clipping Warning",
+                "The fix might significantly alter the grain behavior. "
+                "It is recommended to manually reduce the intensity of the points.\n\n"
+                f"(Maximum calculated shift: {max_shift} positions)\n\n"
+                "Do you want to proceed with the automatic shift anyway?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self._push_undo_global()
+        self.current_scale_data[ch]["x"] = new_xs
+        self.current_scale_data[ch]["y"] = new_ys
+        self.plotter.current_data = copy.deepcopy(self.current_scale_data)
+        self.plotter.refresh()
+        self._refresh_grain_preview()
+        self._update_last_known_state()
+        self._update_ui_state()
+
     def is_dirty(self) -> bool:
         if not self._working or self.event_dict is None:
             return False
@@ -895,6 +1103,8 @@ class SingleEventEditor(QWidget):
         if self.sidebar.get_p_params() != self.original_p_params:
             return True
         if self.sidebar.get_grain_size() != self.original_grain_size:
+            return True
+        if self.sidebar.get_seed() != self.original_seed:
             return True
         if self.sidebar.get_event_time_bounds() != self.original_time_bounds:
             return True
@@ -1023,8 +1233,16 @@ class SingleEventEditor(QWidget):
 
         extremes = getattr(self.grain_preview, "_last_extremes", None)
         scaling_shift = fgs_parser.get_scaling_shift({"p_params": p_params})
+        is_full = self.plotter._full_range_mode if self.plotter else False
+        if hasattr(self, "sidebar") and self.sidebar:
+            self.sidebar.set_clip_context(extremes, scaling_shift, is_full)
         if self.plotter:
-            self.plotter.set_clip_extremes(extremes, scaling_shift)
+            b_depth = (
+                self._video_info.get("bit_depth", 8)
+                if getattr(self, "_video_info", None)
+                else 8
+            )
+            self.plotter.set_clip_extremes(extremes, scaling_shift, bit_depth=b_depth)
             self._update_plot_x_label(p_params)
             self.plotter.refresh()
 
@@ -1216,6 +1434,9 @@ class ARCoefficientsEditor(QDialog):
             self.table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
             self.spinboxes = []
             
+            bold_font = QFont()
+            bold_font.setPointSize(9)
+            bold_font.setBold(True)
             if not is_matrix:
                 self.table_widget.setHorizontalHeaderLabels(["Coefficient", "Value"])
                 self.table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -1238,7 +1459,7 @@ class ARCoefficientsEditor(QDialog):
                     self.spinboxes.append(spin)
                     
                     if is_cross:
-                        label_item.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                        label_item.setFont(bold_font)
                         label_item.setForeground(QBrush(QColor("#2ecc71")))
                         label_item.setBackground(QBrush(QColor("#253c3c")))
                         spin.setStyleSheet("QSpinBox { background-color: #253c3c; color: #2ecc71; font-weight: bold; border: 1px solid #2ecc71; }")
@@ -1274,7 +1495,7 @@ class ARCoefficientsEditor(QDialog):
                             target_item = QTableWidgetItem("Target")
                             target_item.setTextAlignment(Qt.AlignCenter)
                             target_item.setFlags((target_item.flags() & ~Qt.ItemIsEnabled) & ~Qt.ItemIsEditable)
-                            target_item.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                            target_item.setFont(bold_font)
                             target_item.setForeground(QBrush(QColor("#ff4444")))
                             self.table_widget.setItem(r, c, target_item)
                         elif delta_row == 0 and delta_col > 0:
@@ -1298,7 +1519,7 @@ class ARCoefficientsEditor(QDialog):
                     cross_row = lag + 1
                     label_item = QTableWidgetItem("Cross-Correlation")
                     label_item.setFlags(label_item.flags() & ~Qt.ItemIsEditable)
-                    label_item.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                    label_item.setFont(bold_font)
                     label_item.setForeground(QBrush(QColor("#2ecc71")))
                     label_item.setBackground(QBrush(QColor("#253c3c")))
                     self.table_widget.setItem(cross_row, 0, label_item)

@@ -1,12 +1,18 @@
+import math
+
+FPS_RATIONAL_MAP: list[tuple[str, int, int]] = [
+    ("23.976", 24000, 1001),
+    ("24", 24, 1),
+    ("25", 25, 1),
+    ("29.97", 30000, 1001),
+    ("30", 30, 1),
+    ("50", 50, 1),
+    ("59.94", 60000, 1001),
+    ("60", 60, 1),
+]
+
 COMMON_FPS: list[tuple[str, float]] = [
-    ("23.976", 24000 / 1001),
-    ("24", 24.0),
-    ("25", 25.0),
-    ("29.97", 30000 / 1001),
-    ("30", 30.0),
-    ("50", 50.0),
-    ("59.94", 60000 / 1001),
-    ("60", 60.0),
+    (label, num / den) for label, num, den in FPS_RATIONAL_MAP
 ]
 
 DEFAULT_FPS_LABEL = "23.976"
@@ -21,13 +27,35 @@ def fps_from_label(label: str) -> float:
     return float(label)
 
 
+def fps_to_rational(fps: float) -> tuple[int, int] | None:
+    if fps <= 0:
+        return None
+    for _, num, den in FPS_RATIONAL_MAP:
+        val = num / den
+        if abs(fps - val) / val < 1e-5:
+            return num, den
+    return None
+
+
 def ticks_to_frames(ticks: int, fps: float) -> int:
+    if fps <= 0:
+        return 0
+    rat = fps_to_rational(fps)
+    if rat is not None:
+        num, den = rat
+        denom = TICKS_PER_SECOND * den
+        return int((int(ticks) * num + denom // 2) // denom)
     return int((ticks * fps + TICKS_PER_SECOND / 2) // TICKS_PER_SECOND)
 
 
 def frames_to_ticks(frames: int, fps: float) -> int:
-    seconds = frames / fps
-    return round(seconds * TICKS_PER_SECOND)
+    if fps <= 0:
+        return 0
+    rat = fps_to_rational(fps)
+    if rat is not None:
+        num, den = rat
+        return int((int(frames) * TICKS_PER_SECOND * den) // num)
+    return int(math.floor((int(frames) * TICKS_PER_SECOND) / fps + 1e-9))
 
 
 def ticks_to_seconds(ticks: int) -> float:
@@ -77,7 +105,6 @@ def find_closest_fps_label(target_fps: float) -> str | None:
 
 
 def video_info_to_ticks(video_info: dict | None, fps: float | None = None) -> int:
-    """Calculate the total duration of a video in ticks from video_info."""
     if not video_info:
         return 0
     try:
@@ -96,8 +123,7 @@ def video_info_to_ticks(video_info: dict | None, fps: float | None = None) -> in
         fps_num, fps_den = 0, 0
 
     if num_frames > 0 and fps_num > 0 and fps_den > 0 and fps is None:
-        seconds = (num_frames * fps_den) / fps_num
-        return round(seconds * TICKS_PER_SECOND)
+        return int((num_frames * TICKS_PER_SECOND * fps_den) // fps_num)
 
     effective_fps = fps or video_info.get("fps") or 0.0
     try:

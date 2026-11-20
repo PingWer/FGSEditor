@@ -36,7 +36,7 @@ def detect_denoise_accelerators() -> str:
     try:
         kwargs: dict = {"capture_output": True, "text": True, "timeout": 5}
         if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         res = subprocess.run([exe, "list-devices"], **kwargs)
         if res.returncode == 0 and res.stdout:
             backends = []
@@ -66,7 +66,7 @@ class AutoCreateWorker(QThread):
         is_full_range: bool,
         ignore_chroma: bool,
         denoise_method: str = "nl4d",
-        denoise_preset: str = "veryfast",
+        denoise_preset: str = "base",
         denoise_mc: bool = True,
         denoise_channel: str = "luma",
         accelerators: str = "cuda,vulkan",
@@ -98,6 +98,7 @@ class AutoCreateWorker(QThread):
         for p in self._subprocesses:
             try:
                 p.kill()
+                p.wait(timeout=1)
             except Exception:
                 pass
 
@@ -132,6 +133,9 @@ class AutoCreateWorker(QThread):
             total_video_frames: int | None = None
             video_fps_detected: float | None = None
 
+            from fgseditor_qt.tools.video_probe import find_ffmpeg
+            ffmpeg_for_regrain = find_ffmpeg()
+
             if self.av1_video:
                 self.progress_updated.emit(5, "Extracting grain diff against target video...")
                 cmd_regrain = [
@@ -144,14 +148,16 @@ class AutoCreateWorker(QThread):
                     "--scan",
                     "full",
                     "--scene-threshold",
-                    "0.5",
+                    "2.0",
                     "--merge",
                     "0",
-                    "--full-strength",
                     "-y",
+                    "--full-strength",
                     "--progress",
                     "json",
                 ]
+                if ffmpeg_for_regrain:
+                    cmd_regrain.extend(["--ffmpeg", ffmpeg_for_regrain])
                 if self.crop:
                     cmd_regrain.extend(["--crop", self.crop])
                 if self.scale:
@@ -174,7 +180,11 @@ class AutoCreateWorker(QThread):
                 json_err_a: str | None = None
                 for line in p_regrain.stdout:
                     if self._is_cancelled:
-                        p_regrain.kill()
+                        try:
+                            p_regrain.kill()
+                            p_regrain.wait(timeout=1)
+                        except Exception:
+                            pass
                         if os.path.exists(temp_raw_tbl):
                             try:
                                 os.remove(temp_raw_tbl)
@@ -239,22 +249,23 @@ class AutoCreateWorker(QThread):
 
                 self.progress_updated.emit(5, "Denoising and extracting grain...")
 
+                eff_preset = self.denoise_preset
+                if self.denoise_method == "nl4d" and eff_preset not in ("base", "slow"):
+                    eff_preset = "base"
+
                 cmd_denoise = [
                     denoise_exe,
                     self.denoise_method,
                     "-i",
                     self.original_video,
                     "--preset",
-                    self.denoise_preset,
+                    eff_preset,
                 ]
-                if self.denoise_method == "nl4d":
-                    cmd_denoise.extend(["--lambda-ht-scale", "2.0", "--sigma-scale", "2.0"])
-                elif self.denoise_method == "nlmeans":
-                    if self.denoise_mc:
-                        cmd_denoise.append("--motion-compensation")
-                    cmd_denoise.extend(["--strength", "2.0", "--hq-sigma-scale", "2.0"])
-                if self.denoise_channel in ("luma", "yuv"):
-                    cmd_denoise.extend(["--channel-mode", self.denoise_channel])
+                if self.denoise_method == "nlmeans" and self.denoise_mc:
+                    cmd_denoise.append("--motion-compensation")
+                eff_channel = "luma,chroma" if self.denoise_channel in ("yuv", "luma,chroma") else self.denoise_channel
+                if eff_channel in ("luma", "chroma", "luma,chroma"):
+                    cmd_denoise.extend(["--channel-mode", eff_channel])
                 if self.accelerators:
                     cmd_denoise.extend(["--accelerators", self.accelerators])
 
@@ -268,14 +279,16 @@ class AutoCreateWorker(QThread):
                     "--scan",
                     "full",
                     "--scene-threshold",
-                    "0.5",
+                    "2.0",
                     "--merge",
                     "0",
-                    "--full-strength",
                     "-y",
+                    "--full-strength",
                     "--progress",
                     "json",
                 ]
+                if ffmpeg_for_regrain:
+                    cmd_regrain.extend(["--ffmpeg", ffmpeg_for_regrain])
                 if self.ignore_chroma:
                     cmd_regrain.append("--no-chroma")
 
@@ -366,6 +379,7 @@ class AutoCreateWorker(QThread):
                         for p in self._subprocesses:
                             try:
                                 p.kill()
+                                p.wait(timeout=1)
                             except Exception:
                                 pass
                         if os.path.exists(temp_raw_tbl):
@@ -449,12 +463,14 @@ class AutoCreateWorker(QThread):
                 scaled_pct = 75 + int(pct * 0.23)
                 self.progress_updated.emit(scaled_pct, msg)
 
+            b_depth = v_info.get("bit_depth", 8) if v_info else 8
             opt_events = fgs_optimizer.optimize_dynamic_fgs(
                 raw_events,
                 is_full_range=self.is_full_range,
                 ignore_chroma=self.ignore_chroma,
                 is_444=self.is_444,
                 progress_cb=_opt_progress,
+                bit_depth=b_depth,
             )
 
             if opt_events:
@@ -485,17 +501,13 @@ class AutoCreateWorker(QThread):
                                 ev["end_time"] = vid_ticks
                         if trimmed[-1].get("end_time", 0) != vid_ticks:
                             trimmed[-1]["end_time"] = vid_ticks
-                        for ev in trimmed:
-                            params_str = " ".join(ev.get("extra_params", ["1", "7391", "1"]))
-                            ev["e_line"] = f"E {ev['start_time']} {ev['end_time']} {params_str}\n"
                         opt_events = trimmed
                     elif opt_events:
                         ev = opt_events[0]
                         ev["start_time"] = 0
                         ev["end_time"] = vid_ticks
-                        params_str = " ".join(ev.get("extra_params", ["1", "7391", "1"]))
-                        ev["e_line"] = f"E {ev['start_time']} {ev['end_time']} {params_str}\n"
                         opt_events = [ev]
+                    fgs_optimizer.ensure_valid_afgs1_chain(opt_events)
 
             opt_text = fgs_optimizer.build_optimized_fgs_text(opt_events, headers)
 
@@ -676,8 +688,8 @@ class FgsAutoCreateDialog(QDialog):
         lbl_preset = QLabel("Preset:")
         lbl_preset.setStyleSheet("font-weight: bold; min-width: 50px; color: #ffffff;")
         row_algo.addWidget(lbl_preset)
-        self.radio_veryfast = QRadioButton("veryfast")
-        self.radio_fast = QRadioButton("fast")
+        self.radio_veryfast = QRadioButton("base")
+        self.radio_fast = QRadioButton("slow")
         self.radio_veryfast.setChecked(True)
         self.group_preset = QButtonGroup(self)
         self.group_preset.addButton(self.radio_veryfast)
@@ -692,7 +704,7 @@ class FgsAutoCreateDialog(QDialog):
         lbl_chan.setStyleSheet("font-weight: bold; min-width: 90px; color: #ffffff;")
         row_chan.addWidget(lbl_chan)
         self.radio_luma = QRadioButton("luma")
-        self.radio_yuv = QRadioButton("yuv")
+        self.radio_yuv = QRadioButton("luma,chroma")
         self.radio_luma.setChecked(True)
         self.group_chan = QButtonGroup(self)
         self.group_chan.addButton(self.radio_luma)
@@ -707,6 +719,9 @@ class FgsAutoCreateDialog(QDialog):
         row_chan.addStretch(1)
         d_layout.addLayout(row_chan)
 
+        self.radio_nl4d.toggled.connect(self._on_algo_toggled)
+        self._on_algo_toggled(self.radio_nl4d.isChecked())
+
         self.edit_accel = QLineEdit(detect_denoise_accelerators())
         self.edit_accel.setVisible(False)
 
@@ -718,7 +733,7 @@ class FgsAutoCreateDialog(QDialog):
 
         layout.addWidget(self.denoise_group)
 
-        opt_group = QGroupBox("Optimizer Settings")
+        opt_group = QGroupBox("Optimizer & Measurement Settings")
         opt_layout = QHBoxLayout(opt_group)
 
         self.radio_limited = QRadioButton("Limited Range (16-235)")
@@ -940,6 +955,18 @@ class FgsAutoCreateDialog(QDialog):
         finally:
             QApplication.restoreOverrideCursor()
 
+    def _on_algo_toggled(self, is_nl4d: bool):
+        if is_nl4d:
+            self.radio_veryfast.setText("base")
+            self.radio_fast.setText("slow")
+            self.check_mc.setEnabled(False)
+            self.check_mc.setToolTip("Motion tracking is always enabled in nl4d.")
+        else:
+            self.radio_veryfast.setText("veryfast")
+            self.radio_fast.setText("fast")
+            self.check_mc.setEnabled(True)
+            self.check_mc.setToolTip("Enable motion compensation for temporal denoising.")
+
     @property
     def combo_method(self):
         class _MethodProxy:
@@ -951,14 +978,17 @@ class FgsAutoCreateDialog(QDialog):
     def combo_preset(self):
         class _PresetProxy:
             def __init__(self, dlg): self.dlg = dlg
-            def currentText(self): return "veryfast" if self.dlg.radio_veryfast.isChecked() else "fast"
+            def currentText(self):
+                if self.dlg.radio_nl4d.isChecked():
+                    return "base" if self.dlg.radio_veryfast.isChecked() else "slow"
+                return "veryfast" if self.dlg.radio_veryfast.isChecked() else "fast"
         return _PresetProxy(self)
 
     @property
     def combo_channel(self):
         class _ChannelProxy:
             def __init__(self, dlg): self.dlg = dlg
-            def currentText(self): return "luma" if self.dlg.radio_luma.isChecked() else "yuv"
+            def currentText(self): return "luma" if self.dlg.radio_luma.isChecked() else "luma,chroma"
         return _ChannelProxy(self)
 
     def _start_pipeline(self):

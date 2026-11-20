@@ -62,7 +62,13 @@ class InteractiveFGSPlotter(QWidget):
 
         self._clip_extremes: dict | None = None
         self._clip_scaling_shift: int = 8
+        self._clip_bit_depth: int = 8
+        self._clip_collections: list = []
         self._is_chroma_linked: bool = False
+
+        self._photon_noise_active: bool = False
+        self._show_noise_overlay: bool = True
+        self._noise_overlay_data: tuple[list, list] | None = None
 
         self.annot = self.ax.annotate(
             "",
@@ -222,9 +228,12 @@ class InteractiveFGSPlotter(QWidget):
         self.destroy_plot()
         super().closeEvent(event)
 
-    def set_clip_extremes(self, extremes: dict | None, scaling_shift: int = 8) -> None:
+    def set_clip_extremes(
+        self, extremes: dict | None, scaling_shift: int = 8, bit_depth: int = 8
+    ) -> None:
         self._clip_extremes = extremes
         self._clip_scaling_shift = scaling_shift
+        self._clip_bit_depth = bit_depth
 
     def set_full_range_mode(self, enabled: bool) -> None:
         self._full_range_mode = enabled
@@ -238,6 +247,38 @@ class InteractiveFGSPlotter(QWidget):
 
     def is_chroma_linked(self) -> bool:
         return self._is_chroma_linked
+
+    def set_photon_noise_active(self, active: bool) -> None:
+        new_active = bool(active)
+        if self._photon_noise_active != new_active:
+            self._photon_noise_active = new_active
+            self.refresh()
+
+    def set_photon_noise_overlays(self, *args, **kwargs) -> None:
+        """Accepts (noise_data) or legacy (transfer_data, noise_data)."""
+        if len(args) == 2:
+            self._noise_overlay_data = args[1]
+        elif len(args) == 1:
+            self._noise_overlay_data = args[0]
+        elif "noise_data" in kwargs:
+            self._noise_overlay_data = kwargs["noise_data"]
+        if self._photon_noise_active:
+            self.refresh()
+
+    def set_overlay_visibility(self, *args, **kwargs) -> None:
+        """Accepts (show_noise) or legacy (show_transfer, show_noise)."""
+        show_noise = None
+        if len(args) == 2:
+            show_noise = args[1]
+        elif len(args) == 1:
+            show_noise = args[0]
+        elif "show_noise" in kwargs:
+            show_noise = kwargs["show_noise"]
+
+        if show_noise is not None and self._show_noise_overlay != bool(show_noise):
+            self._show_noise_overlay = bool(show_noise)
+            if self._photon_noise_active:
+                self.refresh()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -253,6 +294,13 @@ class InteractiveFGSPlotter(QWidget):
         self.ax.clear()
         self.ax.set_facecolor("#111111")
         self.lines.clear()
+        if hasattr(self, "_clip_collections") and self._clip_collections:
+            for coll in self._clip_collections:
+                try:
+                    coll.remove()
+                except Exception:
+                    pass
+            self._clip_collections.clear()
 
         min_y = float("inf")
         max_y = 0
@@ -279,6 +327,25 @@ class InteractiveFGSPlotter(QWidget):
                     picker=12,
                 )
                 self.lines[channel] = {"line": line, "data": data}
+
+        # Render Photon Noise Theoretical Noise Overlay
+        if self._photon_noise_active and self._show_noise_overlay and self._noise_overlay_data:
+            nx, ny = self._noise_overlay_data
+            if nx and ny:
+                self.ax.plot(
+                    nx,
+                    ny,
+                    color="#fbbf24",
+                    linestyle="-",
+                    linewidth=1.8,
+                    alpha=0.85,
+                    label="Theoretical Noise σ(x)",
+                    zorder=3,
+                    antialiased=True,
+                )
+                if not has_data:
+                    min_y = min(min_y, min(ny))
+                    max_y = max(max_y, max(ny))
 
         self.annot = self.ax.annotate(
             "",
@@ -319,10 +386,16 @@ class InteractiveFGSPlotter(QWidget):
                 ),
             )
 
-        if has_data:
-            y_margin = max(5, (max_y - min_y) * 0.15)
-            self.ax.legend()
-            self.ax.set_xticks([0, 16, 50, 100, 150, 200, 235, 255])
+        if self._clip_extremes and has_data:
+            self._draw_clip_alerts()
+
+        handles, labels = self.ax.get_legend_handles_labels()
+        if handles:
+            self.ax.legend(handles, labels)
+            if self._user_xlim is None:
+                self.ax.set_xticks([0, 16, 50, 100, 150, 200, 235, 255])
+            else:
+                self.ax.xaxis.set_major_locator(MaxNLocator(nbins="auto", integer=True))
 
             if self._full_range_mode:
                 self.ax.axvline(16, color="#4da6ff", linestyle=":", alpha=0.35, linewidth=0.9)
@@ -340,67 +413,117 @@ class InteractiveFGSPlotter(QWidget):
             self.ax.set_xlim(0, 255)
             self.ax.set_ylim(0, 150)
 
-        if self._user_xlim is not None and has_data:
+        y_margin = max(5, (max_y - min_y) * 0.15) if has_data else 10
+
+        if self._user_xlim is not None and (has_data or self._photon_noise_active):
             self.ax.set_xlim(self._user_xlim)
             self.ax.set_ylim(self._user_ylim)
         elif has_data:
             self.ax.set_xlim(0, 255)
             self.ax.set_ylim(min_y - y_margin, max_y + y_margin)
-
-        if self._clip_extremes and has_data:
-            self._draw_clip_alerts()
+        elif self._photon_noise_active:
+            self.ax.set_xlim(0, 255)
+            self.ax.set_ylim(-2, max(30, max_y + 10))
 
         self.canvas.draw()
 
-    def _draw_clip_alerts(self) -> None:
+    def _compute_clip_points(self):
+        if not self._clip_extremes:
+            return [], []
+
         from fgseditor_qt.math.fgs_grain_sim import compute_amplitude_at_point
 
         ext = self._clip_extremes
         s_shift = self._clip_scaling_shift
+        bit_depth = getattr(self, "_clip_bit_depth", 8) or 8
+
+        # Step in 8-bit scale: 1.0 for 8-bit, 0.25 for 10-bit, 0.0625 for 12-bit
+        step = 2.0 ** (-(bit_depth - 8))
+
+        ch = self.active_channel
+        min_bound = 0 if self._full_range_mode else 16
+        max_bound = 255 if self._full_range_mode else (240 if ch in ("sCb", "sCr") else 235)
+
+        low_threshold = min_bound - step
+        high_threshold = max_bound + step
 
         channel_configs = {
-            "sY": ("luma_max", "luma_min", 16, 235),
-            "sCb": ("cb_max", "cb_min", 16, 235),
-            "sCr": ("cr_max", "cr_min", 16, 235),
+            "sY": ("luma_max", "luma_min"),
+            "sCb": ("cb_max", "cb_min"),
+            "sCr": ("cr_max", "cr_min"),
         }
 
-        for channel, data in self.current_data.items():
-            if not data["x"]:
-                continue
-            config = channel_configs.get(channel)
-            if not config:
-                continue
-            max_key, min_key, l_min, l_max = config
-            grain_max = ext.get(max_key, 0)
-            grain_min = ext.get(min_key, 0)
+        data = self.current_data.get(ch)
+        if not data or not data.get("x"):
+            return [], []
 
-            clip_x = []
-            clip_y = []
-            for px, py in zip(data["x"], data["y"]):
-                d_max = compute_amplitude_at_point(grain_max, py, s_shift)
-                d_min = compute_amplitude_at_point(grain_min, py, s_shift)
+        config = channel_configs.get(ch)
+        if not config:
+            return [], []
 
-                if (px + d_max) > l_max or (px + d_min) < l_min:
-                    clip_x.append(px)
-                    clip_y.append(py)
+        max_key, min_key = config
+        grain_max = ext.get(max_key, 0)
+        grain_min = ext.get(min_key, 0)
 
-            if clip_x:
-                self.ax.scatter(
-                    clip_x,
-                    clip_y,
-                    marker="v",
-                    s=80,
-                    c="#ff4444",
-                    edgecolors="#ff8800",
-                    linewidths=1.5,
-                    zorder=8,
-                    label="_clip" if channel != "sY" else "⚠ clips",
-                )
+        clip_x = []
+        clip_y = []
+
+        for px, py in zip(data["x"], data["y"]):
+            d_max = compute_amplitude_at_point(grain_max, py, s_shift)
+            d_min = compute_amplitude_at_point(grain_min, py, s_shift)
+
+            if (px + d_max) >= high_threshold or (px + d_min) <= low_threshold:
+                clip_x.append(px)
+                clip_y.append(py)
+
+        return clip_x, clip_y
+
+    def _draw_clip_alerts(self, update_legend: bool = False) -> None:
+        if hasattr(self, "_clip_collections") and self._clip_collections:
+            for coll in self._clip_collections:
+                try:
+                    coll.remove()
+                except Exception:
+                    pass
+            self._clip_collections.clear()
+        else:
+            self._clip_collections = []
+
+        clip_x, clip_y = self._compute_clip_points()
+        if clip_x:
+            import matplotlib.transforms as mtransforms
+
+            offset_pts = mtransforms.ScaledTranslation(
+                0, 8.5 / 72.0, self.figure.dpi_scale_trans
+            )
+            trans = self.ax.transData + offset_pts
+
+            c = self.ax.scatter(
+                clip_x,
+                clip_y,
+                marker="v",
+                s=65,
+                c="#ff8800",
+                edgecolors="#b45309",
+                linewidths=1.3,
+                zorder=8,
+                transform=trans,
+                clip_on=False,
+            )
+            self._clip_collections.append(c)
+
+        if update_legend:
+            handles, labels = self.ax.get_legend_handles_labels()
+            if handles:
+                self.ax.legend(handles, labels)
+
+    def _update_clip_alerts(self, update_legend: bool = False) -> None:
+        self._draw_clip_alerts(update_legend=update_legend)
 
     def get_point_constraints(self, channel, idx):
         x_list = self.current_data[channel]["x"]
         min_bound = 0 if self._full_range_mode else 16
-        max_bound = 255 if self._full_range_mode else 235
+        max_bound = 255 if self._full_range_mode else (240 if channel in ("sCb", "sCr") else 235)
         min_x = min_bound if idx == 0 else x_list[idx - 1] + 1
         max_x = max_bound if idx == len(x_list) - 1 else x_list[idx + 1] - 1
         return min_x, max_x
@@ -500,7 +623,7 @@ class InteractiveFGSPlotter(QWidget):
                     )
                 else:
                     min_bound = 0 if self._full_range_mode else 16
-                    max_bound = 255 if self._full_range_mode else 235
+                    max_bound = 255 if self._full_range_mode else (240 if ch in ("sCb", "sCr") else 235)
                     new_x = max(min_bound, min(max_bound, x_val))
                     new_y = max(0, min(255, y_val))
 
@@ -603,7 +726,9 @@ class InteractiveFGSPlotter(QWidget):
 
             self.drag_point_index = None
             self._drag_lock_axis = None
+            self._update_clip_alerts(update_legend=True)
             self.data_changed.emit()
+            self.canvas.draw_idle()
 
     def on_motion(self, event):
         if self._is_panning and event.inaxes == self.ax:
@@ -683,6 +808,7 @@ class InteractiveFGSPlotter(QWidget):
         data["y"][idx] = new_y
 
         self.lines[ch]["line"].set_data(data["x"], data["y"])
+        self._update_clip_alerts()
 
         self.annot.xy = (new_x, new_y)
         self.annot.set_text(f"{ch}\nValue: {new_x}\nStrength: {new_y}")

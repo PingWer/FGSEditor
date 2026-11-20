@@ -196,13 +196,16 @@ def inspect_fgs(
     if pref == "regrain":
         exe = get_regrain_path()
         assert exe is not None
-        args = [exe, "export", "--progress", "json", "-y", "--output", output_txt, video_path]
+        from fgseditor_qt.tools.video_probe import find_ffmpeg
+        ffmpeg_exe = find_ffmpeg()
+        ff_opts = ["--ffmpeg", ffmpeg_exe] if ffmpeg_exe else []
+        args = [exe, "export", "--progress", "json", "-y", *ff_opts, "--output", output_txt, video_path]
         rc, stdout, stderr = _run_with_streaming(args, progress_callback)
         if rc != 0:
             combined = (stdout + " " + stderr).lower()
             if any(p in combined for p in ["accesso negato", "os error 5", "access is denied", "permission denied"]):
                 staging_file = os.path.join(_get_staging_dir(output_txt), f".tmp_export_{os.getpid()}_{os.path.basename(output_txt)}")
-                stage_args = [exe, "export", "--progress", "json", "-y", "--output", staging_file, video_path]
+                stage_args = [exe, "export", "--progress", "json", "-y", *ff_opts, "--output", staging_file, video_path]
                 rc, stdout, stderr = _run_with_streaming(stage_args, progress_callback)
                 if rc == 0 and os.path.isfile(staging_file):
                     shutil.move(staging_file, output_txt)
@@ -314,7 +317,10 @@ def apply_fgs(
         if pref == "regrain":
             exe = get_regrain_path()
             assert exe is not None
-            args = [exe, "apply", "--progress", "json", "-y", "--table", clean_table_path, "--output", output_path]
+            from fgseditor_qt.tools.video_probe import find_ffmpeg
+            ffmpeg_exe = find_ffmpeg()
+            ff_opts = ["--ffmpeg", ffmpeg_exe] if ffmpeg_exe else []
+            args = [exe, "apply", "--progress", "json", "-y", *ff_opts, "--table", clean_table_path, "--output", output_path]
             if is_static:
                 args.append("--static-grain")
             args.append(video_path)
@@ -326,7 +332,7 @@ def apply_fgs(
                 combined = (stdout + " " + stderr).lower()
                 if any(p in combined for p in ["accesso negato", "os error 5", "access is denied", "permission denied"]):
                     staging_file = os.path.join(_get_staging_dir(output_path), f".tmp_apply_{os.getpid()}_{os.path.basename(output_path)}")
-                    stage_args = [exe, "apply", "--progress", "json", "-y", "--table", clean_table_path, "--output", staging_file]
+                    stage_args = [exe, "apply", "--progress", "json", "-y", *ff_opts, "--table", clean_table_path, "--output", staging_file]
                     if is_static:
                         stage_args.append("--static-grain")
                     stage_args.append(video_path)
@@ -472,13 +478,16 @@ def remove_fgs(
     if pref == "regrain":
         exe = get_regrain_path()
         assert exe is not None
-        args = [exe, "remove", "--progress", "json", "-y", "--output", output_path, video_path]
+        from fgseditor_qt.tools.video_probe import find_ffmpeg
+        ffmpeg_exe = find_ffmpeg()
+        ff_opts = ["--ffmpeg", ffmpeg_exe] if ffmpeg_exe else []
+        args = [exe, "remove", "--progress", "json", "-y", *ff_opts, "--output", output_path, video_path]
         rc, stdout, stderr = _run_with_streaming(args, progress_callback, timeout=600)
         if rc != 0:
             combined = (stdout + " " + stderr).lower()
             if any(p in combined for p in ["accesso negato", "os error 5", "access is denied", "permission denied"]):
                 staging_file = os.path.join(_get_staging_dir(output_path), f".tmp_remove_{os.getpid()}_{os.path.basename(output_path)}")
-                stage_args = [exe, "remove", "--progress", "json", "-y", "--output", staging_file, video_path]
+                stage_args = [exe, "remove", "--progress", "json", "-y", *ff_opts, "--output", staging_file, video_path]
                 rc, stdout, stderr = _run_with_streaming(stage_args, progress_callback, timeout=600)
                 if rc == 0 and os.path.isfile(staging_file):
                     shutil.move(staging_file, output_path)

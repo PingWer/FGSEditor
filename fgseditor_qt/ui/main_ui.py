@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QRectF, QByteArray
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush
 from PySide6.QtSvg import QSvgRenderer
 
-from fgseditor_qt.core.app_paths import get_base_dir
+from fgseditor_qt.core.app_paths import get_base_dir, get_user_data_dir
 from fgseditor_qt.core.settings_manager import (
     get_setting,
     get_dialog_dir,
@@ -467,8 +467,11 @@ class MainUI(QMainWindow):
         import datetime
         from fgseditor_qt.core.fgs_save import build_static_lines
 
-        backup_dir = os.path.join(get_base_dir(), "backup")
-        os.makedirs(backup_dir, exist_ok=True)
+        backup_dir = os.path.join(get_user_data_dir(), "backup")
+        try:
+            os.makedirs(backup_dir, exist_ok=True)
+        except OSError:
+            return
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
         if self.filepath and os.path.basename(self.filepath) != "Untitled":
@@ -1355,7 +1358,7 @@ class MainUI(QMainWindow):
         save_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Plot as PNG",
-            os.path.join(get_base_dir(), "plot.png"),
+            os.path.join(get_user_data_dir(), "plot.png"),
             "PNG Images (*.png)",
         )
         if not save_path:

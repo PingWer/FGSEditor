@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 
 from PySide6.QtWidgets import (
     QWidget,
@@ -22,6 +23,9 @@ class ParamsSidebar(QWidget):
     params_changed = Signal(dict)
     grain_size_changed = Signal(str)
     photon_noise_changed = Signal(dict)
+    photon_noise_overlays_changed = Signal(object)
+    photon_noise_visibility_changed = Signal(bool)
+    range_mode_changed = Signal(bool)
     template_apply_requested = Signal(dict, int)
     time_changed = Signal(object, object)
     fps_or_mode_changed = Signal()
@@ -30,6 +34,9 @@ class ParamsSidebar(QWidget):
         super().__init__(parent)
         self._suppress = False
         self._p_params: dict = dict(fgs_parser.P_DEFAULTS)
+        self._clip_extremes: dict | None = None
+        self._clip_scaling_shift: int = 8
+        self._clip_is_full_range: bool = False
 
         self.setObjectName("paramsSidebar")
         self.setStyleSheet(
@@ -98,30 +105,83 @@ class ParamsSidebar(QWidget):
         self.panel_templates.setVisible(index == 3 or index == 5)
         self.panel_time.setVisible(index == 4 or index == 5)
 
-    def _generate_and_emit_photon_noise(self, *_) -> None:
-        if self._suppress or not self.panel_photon._pn_enable_chk.isChecked():
-            return
+    def set_clip_context(
+        self, extremes: dict | None, scaling_shift: int = 8, is_full: bool = False
+    ) -> None:
+        self._clip_extremes = extremes
+        self._clip_scaling_shift = scaling_shift
+        self._clip_is_full_range = is_full
 
+    def _on_range_changed_from_panel(self, text: str) -> None:
+        is_full = (text == "FULL")
+        self._clip_is_full_range = is_full
+        self.range_mode_changed.emit(is_full)
+
+    def set_full_range_mode(self, enabled: bool) -> None:
+        target_text = "FULL" if enabled else "LIMITED"
+        if self.panel_photon._pn_range.currentText() != target_text:
+            self.panel_photon._pn_range.blockSignals(True)
+            self.panel_photon._pn_range.setCurrentText(target_text)
+            self.panel_photon._pn_range.blockSignals(False)
+        self._clip_is_full_range = enabled
+        self.recompute_photon_noise_overlays()
+        if self.panel_photon._pn_enable_chk.isChecked():
+            self._generate_and_emit_photon_noise()
+
+    def _on_photon_noise_visibility_changed(self, show_noise: bool) -> None:
+        self.photon_noise_visibility_changed.emit(show_noise)
+
+    def _build_photon_noise_generator(self) -> PhotonNoiseGenerator | None:
         try:
             w = int(self.panel_photon._pn_width.text())
             h = int(self.panel_photon._pn_height.text())
         except ValueError:
-            return
+            return None
 
-        iso = self.panel_photon._pn_iso.value()
-        tf = self.panel_photon._pn_tf.currentText()
-        color_range = self.panel_photon._pn_range.currentText()
-        film_format = self.panel_photon._pn_format.currentText()
+        if w <= 0 or h <= 0:
+            return None
 
-        generator = PhotonNoiseGenerator(
+        return PhotonNoiseGenerator(
             width=w,
             height=h,
-            iso_setting=iso,
-            tc_name=tf,
-            color_range=color_range,
-            film_format=film_format,
+            iso_setting=self.panel_photon._pn_iso.value(),
+            tc_name=self.panel_photon._pn_tf.currentText(),
+            color_range=self.panel_photon._pn_range.currentText(),
+            film_format=self.panel_photon._pn_format.currentText(),
+            authoring_tc_name=self.panel_photon.get_authoring_tf_key(),
+            authoring_strength=self.panel_photon.get_authoring_strength(),
+            drt_rolloff=self.panel_photon.get_drt_rolloff(),
         )
-        sy_points = generator.generate_points(num_points=14)
+
+    def recompute_photon_noise_overlays(self) -> None:
+        if self._suppress:
+            return
+        generator = self._build_photon_noise_generator()
+        if generator is None:
+            return
+
+        active_ch = getattr(self, "_active_channel", "sY")
+        is_chroma = active_ch in ("sCb", "sCr")
+        chroma_gain = (1.0 / math.sqrt(2.0)) if (is_chroma and int(generator.chroma_scaling) == 0) else 1.0
+
+        noise_x, noise_y = generator.get_theoretical_noise_curve(
+            chroma_gain=chroma_gain,
+            is_chroma=is_chroma,
+        )
+
+        self.photon_noise_overlays_changed.emit((noise_x, noise_y))
+        self.photon_noise_visibility_changed.emit(
+            self.panel_photon._pn_show_noise_chk.isChecked(),
+        )
+
+    def _generate_and_emit_photon_noise(self, *_) -> None:
+        if self._suppress or not self.panel_photon._pn_enable_chk.isChecked():
+            return
+
+        generator = self._build_photon_noise_generator()
+        if generator is None:
+            return
+        sy_points = generator.generate_points(num_points=14, ramp_low=1, ramp_high=1)
 
         apply_chroma = self.panel_photon._pn_apply_chroma_chk.isChecked()
 
@@ -132,13 +192,14 @@ class ParamsSidebar(QWidget):
         }
 
         if apply_chroma:
-            sc_points = generator.generate_points(num_points=10)
+            sc_points = generator.generate_chroma_points(num_points=10, ramp_low=1, ramp_high=1)
             payload["sCb"]["x"] = [p[0] for p in sc_points]
             payload["sCb"]["y"] = [p[1] for p in sc_points]
             payload["sCr"]["x"] = [p[0] for p in sc_points]
             payload["sCr"]["y"] = [p[1] for p in sc_points]
 
         self.photon_noise_changed.emit(payload)
+        self.recompute_photon_noise_overlays()
 
     def _on_collapse(self, checked: bool) -> None:
         self._collapsed = checked

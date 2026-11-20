@@ -28,7 +28,7 @@ DEFAULT_SETTINGS = {
     "plotter_color_cr": "#ff3333",
     "plotter_zoom_sensitivity": 1.2,
     "autosave_interval_minutes": 5,
-    "timeline_max_workers": os.cpu_count() or 1,
+    "timeline_max_workers": max(1, (os.cpu_count() or 2) // 2),
     "fgs_grain_cache_size": 128,
     "undo_stack_size": 100,
     "last_video_dir": "",

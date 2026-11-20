@@ -256,6 +256,26 @@ def get_ar_coeff_lag(event: dict) -> int:
     return get_p_params(event).get("ar_coeff_lag", P_DEFAULTS["ar_coeff_lag"])
 
 
+def get_apply_grain(event: dict) -> int:
+    params = event.get("extra_params", [])
+    if len(params) >= 1:
+        try:
+            return int(params[0])
+        except (ValueError, TypeError):
+            pass
+    return 1
+
+
+def get_update_parameters(event: dict) -> int:
+    params = event.get("extra_params", [])
+    if len(params) >= 3:
+        try:
+            return int(params[2])
+        except (ValueError, TypeError):
+            pass
+    return 1
+
+
 def get_grain_seed(event: dict) -> int:
     params = event.get("extra_params", [])
     if len(params) >= 2:
@@ -545,55 +565,87 @@ def parse_fgs_events(
     header_lines = list(lines[: filmgrn_idx + 1])
     current_event = None
     event_counter = 0
+    have_active_model = False
 
     def finalize_event(ev: dict, idx: int) -> None:
         has_child_payload = any(
             line.split("#", 1)[0].strip() for line in ev.get("raw_lines", [])
         )
+        apply_grain = 1
         update_params = 1
+        if len(ev.get("extra_params", [])) >= 1:
+            try:
+                apply_grain = int(ev["extra_params"][0])
+            except (ValueError, TypeError):
+                apply_grain = 1
         if len(ev.get("extra_params", [])) >= 3:
             try:
                 update_params = int(ev["extra_params"][2])
             except (ValueError, TypeError):
                 update_params = 1
 
-        if update_params == 0 and not has_child_payload and events:
-            prev_ev = events[-1]
-            import copy
+        is_zero_grain = (apply_grain == 0)
 
-            ev["scale_data"] = copy.deepcopy(prev_ev.get("scale_data", {}))
-            ev["p_params"] = copy.deepcopy(prev_ev.get("p_params", P_DEFAULTS))
-            ev["raw_lines"] = list(prev_ev.get("raw_lines", []))
-            if warnings is not None:
+        if is_zero_grain and not has_child_payload:
+            ev["scale_data"] = {
+                "sY": {"x": [], "y": []},
+                "sCb": {"x": [], "y": []},
+                "sCr": {"x": [], "y": []},
+            }
+            ev["p_params"] = dict(P_DEFAULTS)
+            ev["raw_lines"] = []
+        elif not is_zero_grain and update_params == 0 and events:
+            master_ev = None
+            for prev in reversed(events):
+                prev_extra = prev.get("extra_params", [])
+                p_ag = int(prev_extra[0]) if len(prev_extra) > 0 else 1
+                p_up = int(prev_extra[2]) if len(prev_extra) > 2 else 1
+                if p_ag == 1 and p_up == 1 and prev.get("scale_data"):
+                    master_ev = prev
+                    break
+            if master_ev is None:
+                for prev in reversed(events):
+                    if prev.get("scale_data"):
+                        master_ev = prev
+                        break
+            if master_ev is None:
+                master_ev = events[-1]
+
+            import copy
+            ev["scale_data"] = copy.deepcopy(master_ev.get("scale_data", {}))
+            ev["p_params"] = copy.deepcopy(master_ev.get("p_params", P_DEFAULTS))
+            ev["raw_lines"] = list(master_ev.get("raw_lines", []))
+            if has_child_payload and warnings is not None:
                 warnings.append(
-                    f"Event {idx}: 'update_parameters = 0' with omitted payload lines; inherited parameters from preceding event."
+                    f"Event {idx}: 'update_parameters = 0' contained redundant payload lines; ignored and inherited parameters from preceding active event."
                 )
         else:
+            effective_warnings = None if is_zero_grain else warnings
             ev["scale_data"] = _parse_scale_from_lines(
                 [line_text.strip() for line_text in ev["raw_lines"]],
                 event_idx=idx,
-                warnings=warnings,
+                warnings=effective_warnings,
             )
             ev["p_params"] = _extract_p_params(
-                ev["raw_lines"], event_idx=idx, warnings=warnings
+                ev["raw_lines"], event_idx=idx, warnings=effective_warnings
             )
             if ev["p_params"] is None:
                 if update_params == 0 and events:
                     import copy
-
                     ev["p_params"] = copy.deepcopy(events[-1].get("p_params", P_DEFAULTS))
                 else:
                     ev["p_params"] = dict(P_DEFAULTS)
-                    warnings.append(
-                        f"Event {idx}: Missing line 'p'; populated with AFGS1 standard defaults."
-                    )
+                    if effective_warnings is not None:
+                        effective_warnings.append(
+                            f"Event {idx}: Missing line 'p'; populated with AFGS1 standard defaults."
+                        )
 
         chroma_from_luma = ev["p_params"].get("chroma_scaling_from_luma", 0) == 1
         if chroma_from_luma:
             if ev["scale_data"]["sCb"]["x"] or ev["scale_data"]["sCr"]["x"]:
                 ev["scale_data"]["sCb"] = {"x": [], "y": []}
                 ev["scale_data"]["sCr"] = {"x": [], "y": []}
-                if warnings is not None:
+                if warnings is not None and not is_zero_grain:
                     warnings.append(
                         f"Event {idx}: 'chroma_scaling_from_luma' is enabled; cleared Chroma curves (must have 0 points per AFGS1 spec)."
                     )
@@ -605,12 +657,13 @@ def parse_fgs_events(
                 continue
             token0 = clean.split()[0].lower()
             if token0 not in body_tokens_valid:
-                if warnings is not None:
+                if warnings is not None and not is_zero_grain:
                     warnings.append(
                         f"Event {idx}: Non-standard inline content '{line.strip()}' detected in event body."
                     )
 
-        _sanitize_event_ar_lines(ev, event_idx=idx, warnings=warnings)
+        effective_ar_warnings = None if is_zero_grain else warnings
+        _sanitize_event_ar_lines(ev, event_idx=idx, warnings=effective_ar_warnings)
 
         cy_coeffs, cb_coeffs, cr_coeffs = extract_ar_coeffs_from_raw_lines(ev["raw_lines"])
         lag = ev["p_params"].get("ar_coeff_lag", 3)
@@ -739,14 +792,21 @@ def parse_fgs_events(
                     )
                 extra_params[1] = "7391"
 
+            ag_is_zero = (extra_params[0] == "0") if len(extra_params) > 0 else False
             try:
                 raw_up = int(extra_params[2])
                 clamped_up = 1 if raw_up != 0 else 0
-                if event_counter == 1 and clamped_up == 0:
+                if ag_is_zero and clamped_up != 0:
+                    clamped_up = 0
+                    if warnings is not None:
+                        warnings.append(
+                            f"Event {event_counter}: Parameter 'update_parameters' ({raw_up}) must be 0 when 'apply_grain' is 0; normalized to 0."
+                        )
+                elif not ag_is_zero and clamped_up == 0 and not have_active_model:
                     clamped_up = 1
                     if warnings is not None:
                         warnings.append(
-                            "Event 1: Parameter 'update_parameters' set to 0 on initial event; normalized to 1."
+                            f"Event {event_counter}: Parameter 'update_parameters' set to 0 on initial active event; normalized to 1."
                         )
                 elif clamped_up != raw_up and warnings is not None:
                     warnings.append(
@@ -754,11 +814,15 @@ def parse_fgs_events(
                     )
                 extra_params[2] = str(clamped_up)
             except ValueError:
+                default_up = "0" if ag_is_zero else "1"
                 if warnings is not None:
                     warnings.append(
-                        f"Event {event_counter}: Non-integer token '{extra_params[2]}' for 'update_parameters'; defaulted to 1."
+                        f"Event {event_counter}: Non-integer token '{extra_params[2]}' for 'update_parameters'; defaulted to {default_up}."
                     )
-                extra_params[2] = "1"
+                extra_params[2] = default_up
+
+            if not ag_is_zero and extra_params[2] == "1":
+                have_active_model = True
 
             current_event = {
                 "start_time": start_t,
@@ -826,14 +890,42 @@ def parse_fgs_events(
             events.append(ev)
             header_lines = actual_headers
 
-    if len(events) > 1 and warnings is not None:
+    if len(events) > 1:
+        if any(
+            events[i + 1].get("start_time", 0) < events[i].get("start_time", 0)
+            for i in range(len(events) - 1)
+        ):
+            events.sort(key=lambda ev: (ev.get("start_time", 0), ev.get("end_time", 0)))
+            if warnings is not None:
+                warnings.append(
+                    "Events were out of chronological order; sorted by start timestamp."
+                )
+
         for i in range(len(events) - 1):
+            curr_start = events[i].get("start_time", 0)
             curr_end = events[i].get("end_time", 0)
             next_start = events[i + 1].get("start_time", 0)
             if next_start < curr_end:
-                warnings.append(
-                    f"Overlapping event boundary between Event {i + 1} (end: {curr_end}) and Event {i + 2} (start: {next_start})."
-                )
+                if next_start > curr_start:
+                    events[i]["end_time"] = next_start
+                    params_str = " ".join(events[i].get("extra_params", ["1", "7391", "1"]))
+                    events[i]["e_line"] = f"E {curr_start} {next_start} {params_str}\n"
+                    if warnings is not None:
+                        warnings.append(
+                            f"Overlapping event boundary between Event {i + 1} (end: {curr_end}) and Event {i + 2} (start: {next_start}); clamped Event {i + 1} end to {next_start}."
+                        )
+                else:
+                    new_next_start = curr_end
+                    next_end = events[i + 1].get("end_time", 0)
+                    new_next_end = max(next_end, new_next_start + 1)
+                    events[i + 1]["start_time"] = new_next_start
+                    events[i + 1]["end_time"] = new_next_end
+                    params_str = " ".join(events[i + 1].get("extra_params", ["1", "7391", "1"]))
+                    events[i + 1]["e_line"] = f"E {new_next_start} {new_next_end} {params_str}\n"
+                    if warnings is not None:
+                        warnings.append(
+                            f"Overlapping event boundary between Event {i + 1} (end: {curr_end}) and Event {i + 2} (start: {next_start}); shifted Event {i + 2} start to {new_next_start}."
+                        )
 
     if max_ticks and max_ticks > 0 and events:
         dropped = [ev for ev in events if ev.get("start_time", 0) >= max_ticks]
@@ -866,6 +958,40 @@ def parse_fgs_events(
                     warnings.append(
                         f"Trimmed event end timestamp from {old_end} to video duration ({max_ticks} ticks)."
                     )
+
+    if events:
+        import copy
+
+        post_master_ev = None
+        for i, ev in enumerate(events):
+            extra = list(ev.get("extra_params") or ["1", "7391", "1"])
+            if len(extra) < 3:
+                defaults = ["1", "7391", "1"]
+                extra.extend(defaults[len(extra) : 3])
+            if extra[0] == "0":
+                if extra[2] != "0":
+                    extra[2] = "0"
+                    ev["extra_params"] = extra
+                    ev["e_line"] = f"E {ev['start_time']} {ev['end_time']} {' '.join(extra)}\n"
+            else:
+                if extra[2] == "0" and post_master_ev is None:
+                    extra[2] = "1"
+                    ev["extra_params"] = extra
+                    ev["e_line"] = f"E {ev['start_time']} {ev['end_time']} {' '.join(extra)}\n"
+                    post_master_ev = ev
+                    if warnings is not None:
+                        warnings.append(
+                            f"Event {i + 1}: Promoted 'update_parameters' to 1 after timeline sorting/trimming."
+                        )
+                elif extra[2] != "0":
+                    post_master_ev = ev
+                elif post_master_ev is not None:
+                    if post_master_ev.get("scale_data") is not None:
+                        ev["scale_data"] = copy.deepcopy(post_master_ev["scale_data"])
+                    if post_master_ev.get("p_params") is not None:
+                        ev["p_params"] = copy.deepcopy(post_master_ev["p_params"])
+                    if post_master_ev.get("raw_lines") is not None:
+                        ev["raw_lines"] = list(post_master_ev["raw_lines"])
 
     if return_warnings:
         return header_lines, events, warnings
@@ -906,17 +1032,29 @@ def is_dynamic(events):
     return len(events) > 1
 
 
-def available_grain_presets() -> list[str]:
+def _get_grain_size_dir() -> str:
     import os
+    import sys
     from fgseditor_qt.core.app_paths import get_base_dir
 
     table_dir = os.path.normpath(os.path.join(get_base_dir(), "FGS_grain_size"))
+    if not os.path.isdir(table_dir) and hasattr(sys, "_MEIPASS"):
+        meipass_dir = os.path.normpath(os.path.join(sys._MEIPASS, "FGS_grain_size"))
+        if os.path.isdir(meipass_dir):
+            return meipass_dir
+    return table_dir
+
+
+def available_grain_presets() -> list[str]:
+    import os
+
+    table_dir = _get_grain_size_dir()
     if not os.path.isdir(table_dir):
         return []
     sizes = []
     for fname in os.listdir(table_dir):
         base, ext = os.path.splitext(fname)
-        if ext == ".txt":
+        if ext.lower() == ".txt":
             sizes.append(base)
 
     return sorted(sizes, key=natural_sort_key)
@@ -924,13 +1062,18 @@ def available_grain_presets() -> list[str]:
 
 def load_grain_preset(name: str) -> dict | None:
     import os
-    from fgseditor_qt.core.app_paths import get_base_dir
 
-    table_dir = os.path.normpath(os.path.join(get_base_dir(), "FGS_grain_size"))
+    table_dir = _get_grain_size_dir()
 
     if not os.path.isdir(table_dir):
         return None
     path = os.path.join(table_dir, f"{name}.txt")
+    if not os.path.isfile(path):
+        for fname in os.listdir(table_dir):
+            base, ext = os.path.splitext(fname)
+            if base == name and ext.lower() == ".txt":
+                path = os.path.join(table_dir, fname)
+                break
     if not os.path.isfile(path):
         return None
 
@@ -947,4 +1090,65 @@ def load_grain_preset(name: str) -> dict | None:
         "cCb": cb,
         "cCr": cr,
     }
+
+
+def find_master_event_idx(events: list[dict], current_idx: int) -> int | None:
+    if current_idx <= 0 or current_idx >= len(events):
+        return None
+
+    for i in range(current_idx - 1, -1, -1):
+        ev = events[i]
+        extra = ev.get("extra_params") or ["1", "7391", "1"]
+        try:
+            ag = int(extra[0]) if len(extra) > 0 else 1
+            up = int(extra[2]) if len(extra) > 2 else 1
+        except (ValueError, TypeError):
+            ag, up = 1, 1
+        if ag == 1 and up == 1:
+            return i
+
+    return None
+
+
+def find_linked_event_indices(
+    events: list[dict],
+    master_idx: int,
+    require_active_master: bool = True,
+) -> list[int]:
+    """Return 0-based indices of active ``update_parameters == 0`` events inheriting from *master_idx*.
+
+    Scans forward across ``apply_grain == 0`` pauses (which do not reset the AFGS1 model)
+    and stops at the next active ``update_parameters == 1`` master event.
+    """
+    if master_idx < 0 or master_idx >= len(events):
+        return []
+
+    if require_active_master:
+        m_extra = events[master_idx].get("extra_params") or ["1", "7391", "1"]
+        try:
+            m_ag = int(m_extra[0]) if len(m_extra) > 0 else 1
+            m_up = int(m_extra[2]) if len(m_extra) > 2 else 1
+        except (ValueError, TypeError):
+            m_ag, m_up = 1, 1
+        if m_ag == 0 or m_up == 0:
+            return []
+
+    linked: list[int] = []
+    for i in range(master_idx + 1, len(events)):
+        ev = events[i]
+        extra = ev.get("extra_params") or ["1", "7391", "1"]
+        try:
+            ag = int(extra[0]) if len(extra) > 0 else 1
+            up = int(extra[2]) if len(extra) > 2 else 1
+        except (ValueError, TypeError):
+            ag, up = 1, 1
+        if ag == 0:
+            continue
+        if up == 0:
+            linked.append(i)
+        else:
+            break
+
+    return linked
+
 
